@@ -100,6 +100,23 @@ class TestToolProgressCallback:
 # ---------------------------------------------------------------------------
 
 
+class TestMessageCallback:
+    def test_hides_acp_completion_marker(self, mock_conn, event_loop_fixture):
+        with patch("acp_adapter.events._send_update") as send:
+            cb = make_message_cb(mock_conn, "session-1", event_loop_fixture)
+            cb("Verified.\n<!-- HERMES_STATUS: COMPLETE -->")
+
+        emitted = [call.args[3].content.text for call in send.call_args_list]
+        assert emitted == ["Verified.\n"]
+
+    def test_hides_marker_split_across_stream_chunks(self, mock_conn, event_loop_fixture):
+        with patch("acp_adapter.events._send_update") as send:
+            cb = make_message_cb(mock_conn, "session-1", event_loop_fixture)
+            cb("Verified.\n<!-- HERMES_")
+            cb("STATUS: COMPLETE -->")
+
+        emitted = [call.args[3].content.text for call in send.call_args_list]
+        assert "".join(emitted) == "Verified.\n"
 
 
 # ---------------------------------------------------------------------------

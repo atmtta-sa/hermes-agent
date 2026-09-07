@@ -92,6 +92,17 @@ class TestReadCommandOutputFiles:
         assert stderr == "warn"
 
 
+class TestBrowserSubprocessCwd:
+    def test_uses_existing_hermes_home_instead_of_inherited_cwd(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        monkeypatch.setattr(bt, "get_hermes_home", lambda: str(hermes_home))
+
+        resolved = bt._browser_subprocess_cwd()
+
+        assert resolved == str(hermes_home)
+        assert hermes_home.is_dir()
+
+
 class TestCommandTimeoutRecovery:
     @pytest.mark.parametrize("cloud", [False, True])
     def test_timeout_replaces_only_stuck_client(self, monkeypatch, tmp_path, cloud):

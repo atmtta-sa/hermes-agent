@@ -1,11 +1,38 @@
 """Tests for acp_adapter.entry startup wiring."""
 
+import logging
 import sys
 
 import acp
 import pytest
 
 from acp_adapter import entry
+
+
+class _FilePipelineHandler(logging.Handler):
+    """Stand-in for Hermes's queued agent.log pipeline."""
+
+
+def test_setup_logging_preserves_file_pipeline_and_replaces_stream_handler(monkeypatch):
+    root = logging.getLogger()
+    prior_handlers = root.handlers[:]
+    prior_level = root.level
+    file_pipeline = _FilePipelineHandler()
+    old_stream = logging.StreamHandler()
+    monkeypatch.setattr(entry.sys, "stderr", object())
+    root.handlers = [file_pipeline, old_stream]
+
+    try:
+        entry._setup_logging()
+
+        assert file_pipeline in root.handlers
+        assert old_stream not in root.handlers
+        streams = [handler for handler in root.handlers if isinstance(handler, logging.StreamHandler)]
+        assert len(streams) == 1
+        assert streams[0].stream is entry.sys.stderr
+    finally:
+        root.handlers = prior_handlers
+        root.setLevel(prior_level)
 
 
 def test_main_enables_unstable_protocol(monkeypatch):

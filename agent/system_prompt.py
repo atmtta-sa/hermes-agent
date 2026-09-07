@@ -503,6 +503,10 @@ def _guidance_parts(agent: Any) -> List[str]:
                 ("_parallel_tool_call_guidance", PARALLEL_TOOL_CALL_GUIDANCE),
             ) if getattr(agent, flag, True)
         ]
+        if str(getattr(agent, "platform", "") or "").lower() == "acp":
+            from agent.acp_completion_stop import ACP_COMPLETION_GUIDANCE
+
+            parts.append(ACP_COMPLETION_GUIDANCE)
     parts.append(_tool_guidance_block(agent))  # None/empty entries are dropped by _join_tier
     if not agent.valid_tool_names:
         return parts

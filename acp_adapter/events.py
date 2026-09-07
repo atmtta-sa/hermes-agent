@@ -18,6 +18,56 @@ from .tools import _json_loads_maybe, build_tool_complete, build_tool_start, coe
 
 logger = logging.getLogger(__name__)
 
+_ACP_COMPLETION_MARKER_OPEN = "<!-- HERMES_STATUS:"
+_ACP_COMPLETION_MARKER_CLOSE = "-->"
+
+
+class _ACPCompletionMarkerFilter:
+    """Remove internal completion markers even when streaming splits them."""
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._inside_marker = False
+
+    def feed(self, text: str | None) -> str:
+        if text is None:
+            flushed = "" if self._inside_marker else self._buffer
+            self._buffer = ""
+            self._inside_marker = False
+            return flushed
+
+        self._buffer += text
+        visible: list[str] = []
+        while self._buffer:
+            if self._inside_marker:
+                marker_end = self._buffer.find(_ACP_COMPLETION_MARKER_CLOSE)
+                if marker_end < 0:
+                    break
+                self._buffer = self._buffer[marker_end + len(_ACP_COMPLETION_MARKER_CLOSE) :]
+                self._inside_marker = False
+                continue
+
+            marker_start = self._buffer.find(_ACP_COMPLETION_MARKER_OPEN)
+            if marker_start >= 0:
+                visible.append(self._buffer[:marker_start])
+                self._buffer = self._buffer[marker_start + len(_ACP_COMPLETION_MARKER_OPEN) :]
+                self._inside_marker = True
+                continue
+
+            keep = self._possible_marker_prefix_length()
+            emit_to = len(self._buffer) - keep
+            visible.append(self._buffer[:emit_to])
+            self._buffer = self._buffer[emit_to:]
+            break
+        return "".join(visible)
+
+    def _possible_marker_prefix_length(self) -> int:
+        limit = min(len(self._buffer), len(_ACP_COMPLETION_MARKER_OPEN) - 1)
+        for length in range(limit, 0, -1):
+            if _ACP_COMPLETION_MARKER_OPEN.startswith(self._buffer[-length:]):
+                return length
+        return 0
+
 # ACP plans only support pending/in_progress/completed. Cancelled tasks are kept
 # as terminal entries so the client's full-list replacement doesn't drop them.
 _PLAN_STATUS = {"pending": "pending", "in_progress": "in_progress", "completed": "completed", "cancelled": "completed"}
@@ -136,7 +186,14 @@ def make_thinking_cb(conn: acp.Client, session_id: str, loop: asyncio.AbstractEv
 
 def make_message_cb(conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop) -> Callable:
     """Create a callback that streams agent response text to the editor."""
-    return _make_text_cb(conn, session_id, loop, acp.update_agent_message_text)
+    marker_filter = _ACPCompletionMarkerFilter()
+
+    def _message(text: str | None) -> None:
+        visible = marker_filter.feed(text)
+        if visible:
+            _send_update(conn, session_id, loop, acp.update_agent_message_text(visible))
+
+    return _message
 
 
 def make_step_cb(

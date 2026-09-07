@@ -45,6 +45,24 @@ def _build_browser_env() -> dict:
     return env
 
 
+def _browser_subprocess_cwd() -> str:
+    """Return an existing cwd for browser/Node child processes.
+
+    An IDE-owned ACP process can outlive a renamed or removed workspace. Node's
+    startup then fails with ``uv_cwd`` before agent-browser handles the command.
+    """
+    try:
+        cwd = os.path.abspath(os.fspath(get_hermes_home()))
+        os.makedirs(cwd, exist_ok=True)
+        if os.path.isdir(cwd):
+            return cwd
+    except (OSError, TypeError, ValueError):
+        logger.debug("Could not prepare Hermes home as browser cwd", exc_info=True)
+    cwd = tempfile.gettempdir()
+    os.makedirs(cwd, exist_ok=True)
+    return cwd
+
+
 try:
     from tools.website_policy import check_website_access
 except Exception:

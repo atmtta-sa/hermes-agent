@@ -56,7 +56,7 @@ class _BenignProbeMethodFilter(logging.Filter):
 
 
 def _setup_logging() -> None:
-    """Route all logging to stderr so stdout stays clean for ACP stdio."""
+    """Keep centralized file logging and route ACP console logs to stderr."""
     from agent.redact import RedactingFormatter
 
     handler = logging.StreamHandler(sys.stderr)
@@ -64,7 +64,10 @@ def _setup_logging() -> None:
                                             datefmt="%Y-%m-%d %H:%M:%S"))
     handler.addFilter(_BenignProbeMethodFilter())
     root = logging.getLogger()
-    root.handlers.clear()
+    for existing in list(root.handlers):
+        if isinstance(existing, logging.StreamHandler) and not isinstance(existing, logging.FileHandler):
+            root.removeHandler(existing)
+            existing.close()
     root.addHandler(handler)
     root.setLevel(logging.INFO)
     for noisy in ("httpx", "httpcore", "openai"):

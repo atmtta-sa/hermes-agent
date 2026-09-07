@@ -1,8 +1,9 @@
 """Text-response stop gates for the conversation turn loop.
 
-When the model stops with a text answer, three gates may instead append the answer as an
+When the model stops with a text answer, four gates may instead append the answer as an
 interim row plus a synthetic user-role nudge and continue the turn: verify-on-stop (#65919),
-the ``pre_verify`` plugin hook after code edits, and the kanban worker terminal-tool guard.
+the ``pre_verify`` plugin hook after code edits, the ACP completion contract, and the kanban
+worker terminal-tool guard.
 Each keeps the candidate answer as a budget-exhaustion fallback
 (``pending_verification_response``) and clears ``final_response`` so the finalizer can tell
 this gate from error exits (#61631). Nothing here imports ``agent.conversation_loop`` at
@@ -74,6 +75,22 @@ def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
     except Exception:
         logger.debug("pre_verify hook check failed", exc_info=True)
     return None
+
+
+def _acp_completion_stop_nudge(agent, messages, final_response) -> Optional[str]:
+    """Require a terminal state for tool-using ACP turns."""
+    try:
+        from agent.acp_completion_stop import build_acp_completion_stop_nudge
+
+        return build_acp_completion_stop_nudge(
+            agent=agent,
+            messages=messages,
+            final_response=final_response,
+            attempts=getattr(agent, "_acp_completion_stop_nudges", 0),
+        )
+    except Exception:
+        logger.debug("ACP completion stop-loop check failed", exc_info=True)
+        return None
 
 
 def _kanban_stop_nudge(agent, messages) -> Optional[str]:
@@ -148,6 +165,20 @@ def apply_stop_gates(
         )
         verdict = _continue(_verify_nudge2, "_pre_verify_synthetic")
         logger.debug("pre_verify nudge issued (attempt %d)", agent._pre_verify_nudges)
+        return verdict
+
+    _acp_nudge = _acp_completion_stop_nudge(agent, messages, final_response)
+    if _acp_nudge:
+        agent._acp_completion_stop_nudges = getattr(agent, "_acp_completion_stop_nudges", 0) + 1
+        final_msg["finish_reason"] = "acp_completion_required"
+        _append_interim_answer(
+            agent, final_msg, messages, conversation_history, "ACP completion interim flush failed"
+        )
+        verdict = _continue(_acp_nudge, "_acp_completion_stop_synthetic")
+        logger.info(
+            "ACP completion stop-loop nudge issued (attempt %d)",
+            agent._acp_completion_stop_nudges,
+        )
         return verdict
 
     _kanban_nudge = _kanban_stop_nudge(agent, messages)

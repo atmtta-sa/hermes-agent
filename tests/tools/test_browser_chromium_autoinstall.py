@@ -51,12 +51,14 @@ class TestInstall:
 
         def fake_run(cmd, **kw):
             captured["cmd"] = cmd
+            captured["cwd"] = kw.get("cwd")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(bt.subprocess, "run", fake_run)
 
         assert bt_install._maybe_autoinstall_chromium() is True
         assert captured["cmd"] == ["/x/agent-browser", "install"]
+        assert captured["cwd"] == bt._browser_subprocess_cwd()
         assert "--with-deps" not in captured["cmd"]
 
     def test_npx_form_is_binary_only(self, monkeypatch):

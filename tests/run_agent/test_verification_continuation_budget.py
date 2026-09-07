@@ -17,6 +17,16 @@ def _response(content="composed report"):
     )
 
 
+def _tool_response(name="read_file"):
+    tool_call = SimpleNamespace(id="call-1", function=SimpleNamespace(name=name, arguments="{}"))
+    message = SimpleNamespace(content="", tool_calls=[tool_call])
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason="tool_calls")],
+        model="test/model",
+        usage=None,
+    )
+
+
 @pytest.fixture
 def agent(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
@@ -251,3 +261,39 @@ def test_streamed_interim_then_different_summary_not_marked_previewed(agent, mon
     # CRITICAL: response_previewed must be False — the interim narration was
     # NOT the final response, so the CLI must render the summary.
     assert result["response_previewed"] is False
+
+
+def test_acp_completion_guard_continues_after_plan_only_stop(agent, monkeypatch):
+    agent.platform = "acp"
+    agent.max_iterations = 3
+    agent.iteration_budget.max_total = 3
+    agent.valid_tool_names = {"read_file"}
+    answers = iter([
+        _tool_response(),
+        _response("Plan complete. Next recommended step: implement it."),
+        _response("Implemented and verified.\n<!-- HERMES_STATUS: COMPLETE -->"),
+    ])
+    agent._interruptible_api_call = lambda _kwargs: next(answers)
+
+    def execute_tool(_message, messages, _task_id, _api_count):
+        messages.append({
+            "role": "tool", "name": "read_file", "tool_call_id": "call-1", "content": "inspected",
+        })
+
+    agent._execute_tool_calls = execute_tool
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch("hermes_cli.plugins.has_hook", return_value=False),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("Continue the approved slice.")
+
+    assert result["final_response"] == "Implemented and verified."
+    assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
+    assert agent.iteration_budget.used == 3
+    assert not any(
+        message.get("_acp_completion_stop_synthetic")
+        for message in result["messages"]
+        if isinstance(message, dict)
+    )

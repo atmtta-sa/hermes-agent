@@ -223,6 +223,12 @@ def finish_text_response(
         final_response = None
         return _verdict("continue")
 
+    if str(getattr(agent, "platform", "") or "").lower() == "acp":
+        from agent.acp_completion_stop import strip_acp_completion_status
+
+        final_response = strip_acp_completion_status(final_response)
+        final_msg["content"] = final_response
+
     append_message(messages, final_msg)
     # Make the answer durable before leaving the loop (_DB_PERSISTED_MARKER keeps
     # _persist_session idempotent). Failure must NOT abort the turn: finalize retries.

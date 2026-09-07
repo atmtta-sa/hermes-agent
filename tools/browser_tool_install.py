@@ -188,7 +188,9 @@ def warm_agent_browser_npx_cache(timeout: float = 60.0) -> bool:
     # install-time lifecycle scripts here. --prefer-offline: once cached, repeat runs must not re-hit the registry.
     cmd = [npx_bin, "--ignore-scripts", "--prefer-offline", "-y", _bt.AGENT_BROWSER_NPX_SPEC, "--version"]
     try:
-        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, **popen_kwargs)
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, cwd=_bt._browser_subprocess_cwd(), **popen_kwargs
+        )
     except Exception:
         return False
     try:
@@ -268,7 +270,8 @@ def _maybe_autoinstall_chromium() -> bool:
     _bt.logger.info("browser: Chromium missing — auto-installing the browser binary (one-time ~170MB; disable via security.allow_lazy_installs)")
     try:
         proc = subprocess.run(install_cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=600,
-                              env=_bt._build_browser_env(), stdin=subprocess.DEVNULL)
+                              env=_bt._build_browser_env(), cwd=_bt._browser_subprocess_cwd(),
+                              stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError) as e:
         _bt.logger.warning("browser: Chromium auto-install failed to start: %s", e)
         return False
