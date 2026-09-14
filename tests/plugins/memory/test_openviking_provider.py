@@ -1091,6 +1091,60 @@ def test_on_session_switch_commits_old_session_and_rotates_id():
     assert provider._turn_count == 0
 
 
+def test_controlled_mode_exposes_only_allowlisted_tools(monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_OPENVIKING_ALLOWED_TOOLS",
+        "viking_search,viking_read,viking_browse,viking_remember",
+    )
+    provider = OpenVikingMemoryProvider()
+
+    schemas = provider.get_tool_schemas()
+
+    assert [schema["name"] for schema in schemas] == [
+        "viking_search",
+        "viking_read",
+        "viking_browse",
+        "viking_remember",
+    ]
+
+
+def test_controlled_mode_denies_non_allowlisted_tool_calls(monkeypatch):
+    monkeypatch.setenv("HERMES_OPENVIKING_ALLOWED_TOOLS", "viking_search")
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+
+    result = json.loads(
+        provider.handle_tool_call("viking_forget", {"uri": "viking://user/test.md"})
+    )
+
+    assert "error" in result
+    assert "not allowed" in result["error"]
+    provider._client.delete.assert_not_called()
+
+
+def test_controlled_mode_disables_automatic_session_capture(monkeypatch):
+    monkeypatch.setenv("HERMES_OPENVIKING_CAPTURE_TURNS", "0")
+    provider = _make_provider_with_session("controlled-sid", turn_count=2)
+
+    provider.sync_turn("raw user turn", "raw assistant turn")
+    provider.on_session_end([])
+    provider.on_session_switch("next-sid", parent_session_id="controlled-sid")
+
+    provider._client.post.assert_not_called()
+    assert provider._session_id == "next-sid"
+    assert provider._turn_count == 0
+
+
+def test_controlled_mode_disables_implicit_memory_mirroring(monkeypatch):
+    monkeypatch.setenv("HERMES_OPENVIKING_MIRROR_MEMORY_WRITES", "0")
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+
+    provider.on_memory_write("add", "memory", "verified but local-only note")
+
+    provider._client.post.assert_not_called()
+
+
 def test_sync_turn_captures_session_id_before_worker_runs():
     """Worker must use the session id snapshotted at sync_turn() call time, not
     re-read self._session_id later — otherwise a delayed worker can write the

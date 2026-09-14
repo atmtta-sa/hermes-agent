@@ -28,7 +28,7 @@ import uuid
 import zipfile
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 from urllib.parse import quote, unquote, urlparse
@@ -63,6 +63,9 @@ _DEFERRED_COMMIT_TIMEOUT = (_TIMEOUT * 2) + 5.0
 _SESSION_MESSAGE_BATCH_LIMIT = 100
 _REMOTE_RESOURCE_PREFIXES = ("http://", "https://", "git@", "ssh://", "git://")
 _SYNC_TRACE_ENV = "HERMES_OPENVIKING_SYNC_TRACE"
+_CAPTURE_TURNS_ENV = "HERMES_OPENVIKING_CAPTURE_TURNS"
+_MIRROR_MEMORY_WRITES_ENV = "HERMES_OPENVIKING_MIRROR_MEMORY_WRITES"
+_ALLOWED_TOOLS_ENV = "HERMES_OPENVIKING_ALLOWED_TOOLS"
 _RECALL_QUERY_MIN_CHARS = 5
 _RECALL_MIN_TIMEOUT_SECONDS = 0.05
 _READ_BATCH_LIMIT = 3
@@ -136,6 +139,30 @@ _LEGACY_RECOVERY_LOCK_FILENAME = "legacy-recovery.lock"
 _LOCK_BUSY_ERRNOS = {errno.EWOULDBLOCK, errno.EACCES, errno.EAGAIN}
 _INVALID_SETTING_WARNINGS: Set[tuple[str, str]] = set()
 _INVALID_SETTING_WARNINGS_LOCK = threading.Lock()
+
+
+def _env_enabled(name: str, *, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _allowed_tool_names() -> Optional[Set[str]]:
+    raw = os.environ.get(_ALLOWED_TOOLS_ENV)
+    if raw is None:
+        return None
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
+def _capture_turns(method: Callable) -> Callable:
+    @wraps(method)
+    def guarded(*args, **kwargs):
+        if not _env_enabled(_CAPTURE_TURNS_ENV):
+            return None
+        return method(*args, **kwargs)
+
+    return guarded
 
 
 @dataclass(frozen=True)
@@ -2015,6 +2042,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         flush_tool_parts()
         return payload_messages
 
+    @_capture_turns
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "",
                   messages: Optional[List[Dict[str, Any]]] = None) -> None:
         """Record the conversation turn in OpenViking's session (non-blocking)."""
@@ -2342,6 +2370,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         self._spawn_tracked(f"openviking-finalize-{sid}", _finalize, self._deferred_commit_lock, lambda: self._deferred_commit_threads)
 
+    @_capture_turns
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Commit the session (synchronously — it must land before process exit) to
         trigger extraction of profile/preferences/entities/events/cases/patterns."""
@@ -2361,6 +2390,15 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 if self._session_id == sid:
                     self._turn_count = 0
 
+    def _session_switch_id(self, new_session_id: str) -> Optional[str]:
+        new_id = str(new_session_id or "").strip()
+        if new_id and not _env_enabled(_CAPTURE_TURNS_ENV):
+            with self._session_state_lock:
+                self._session_id = new_id
+                self._turn_count = 0
+            return None
+        return new_id or None
+
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False, **kwargs) -> None:
         """Commit the old session and rotate cached state to the new session_id.
 
@@ -2372,7 +2410,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         The new session never accumulates messages, and memory extraction never fires for it. See
         hermes-agent#28296.
         """
-        new_id = str(new_session_id or "").strip()
+        new_id = self._session_switch_id(new_session_id)
         if not new_id or not self._ensure_client():
             return
         rewound = bool(kwargs.get("rewound"))
@@ -2433,6 +2471,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
     def on_memory_write(self, action: str, target: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Mirror successful built-in memory additions to OpenViking."""
+        if not _env_enabled(_MIRROR_MEMORY_WRITES_ENV):
+            return
         if action != "add" or not content or not self._ensure_client():
             return
         subdir = _MEMORY_WRITE_TARGET_SUBDIR_MAP.get(target, "preferences")
@@ -2455,9 +2495,15 @@ class OpenVikingMemoryProvider(MemoryProvider):
     # -- tools ------------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return list(_TOOL_SCHEMAS)
+        allowed = _allowed_tool_names()
+        if allowed is None:
+            return list(_TOOL_SCHEMAS)
+        return [schema for schema in _TOOL_SCHEMAS if schema["name"] in allowed]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
+        allowed = _allowed_tool_names()
+        if allowed is not None and tool_name not in allowed:
+            return tool_error(f"OpenViking tool is not allowed by runtime policy: {tool_name}")
         if not self._ensure_client():
             return tool_error("OpenViking server not connected")
         handler = _TOOL_HANDLERS.get(tool_name)
