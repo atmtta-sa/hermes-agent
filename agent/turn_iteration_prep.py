@@ -83,8 +83,8 @@ def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
 
 @dataclass
 class IterationPrep:
-    """Always ``action == "fallthrough"``. ``messages`` is the (possibly filtered) transcript
-    and ``request_logger`` the per-request logger the caller keeps using."""
+    """``action`` is ``fallthrough`` or a pre-request ``stop``. ``messages`` is the
+    (possibly filtered) transcript and ``request_logger`` the per-request logger."""
 
     action: str
     messages: Any
@@ -92,8 +92,56 @@ class IterationPrep:
     current_turn_user_idx: Any
 
 
+def _positive_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _request_budget_stop_reason(agent: Any, messages: Any) -> str | None:
+    """Return a fail-closed reason when an explicit request/run ceiling is exhausted."""
+    counters = (
+        ("max_model_requests_per_run", "session_api_calls", "model_request_budget_exhausted"),
+        ("max_cumulative_input_tokens", "session_input_tokens", "run_input_token_budget_exhausted"),
+    )
+    for limit_name, used_name, reason in counters:
+        limit = _positive_int(getattr(agent, limit_name, None))
+        if limit is not None and int(getattr(agent, used_name, 0) or 0) >= limit:
+            return reason
+
+    request_input_limit = _positive_int(getattr(agent, "max_request_input_tokens", None))
+    if request_input_limit is None:
+        return None
+    from agent.model_metadata import estimate_request_tokens_rough
+
+    estimated = estimate_request_tokens_rough(
+        messages,
+        system_prompt=str(getattr(agent, "system_message", "") or ""),
+        tools=getattr(agent, "tools", None) or None,
+    )
+    if estimated > request_input_limit:
+        return "request_input_token_budget_exhausted"
+    return None
+
+
+def _request_budget_stop_verdict(agent: Any, messages: Any, request_logger: Any) -> IterationPrep | None:
+    reason = _request_budget_stop_reason(agent, messages)
+    if not reason:
+        return None
+    agent._request_budget_stop_reason = reason
+    request_logger.warning(
+        "Stopping before provider request: %s (session=%s)",
+        reason,
+        getattr(agent, "session_id", None) or "-",
+    )
+    return IterationPrep(action="stop", messages=messages, request_logger=request_logger)
+
+
 def prepare_iteration(
-    agent: Any, *, messages: Any, api_call_count: Any, user_message: Any = None, current_turn_user_idx: Any = None,
+    agent: Any,
+    *,
+    messages: Any,
+    api_call_count: Any,
+    user_message: Any = None,
+    current_turn_user_idx: Any = None,
 ) -> IterationPrep:
     """Prepare ``messages`` for this iteration in the original order. Every mutation here is
     cache-safe by construction: steer text is appended as a new (not yet persisted) user row, the ghost-row
@@ -101,6 +149,11 @@ def prepare_iteration(
     from agent.conversation_loop import (
         _INTERRUPT_SCAFFOLD_MARKER, _maybe_inject_run_budget_wrapup
     )
+
+    request_logger = getattr(agent, "logger", None) or logger
+    budget_stop = _request_budget_stop_verdict(agent, messages, request_logger)
+    if budget_stop is not None:
+        return budget_stop
 
     # nous.anthropic_wire=auto: a wire switch decided from the previous response lands here,
     # before this iteration's request is built and with nothing in flight.
@@ -144,7 +197,6 @@ def prepare_iteration(
     # Appended to the newest tool result; never a synthetic user/system row.
     _maybe_inject_iteration_budget_warning(agent, messages)
 
-    request_logger = getattr(agent, "logger", None) or logger  # same name as the origin module
     # Per-agent validation cursor skips re-parsing tool_call args already validated.
     # Identity-keyed; a rewritten list breaks the prefix match and forces a re-scan.
     _sanitize_cursor = getattr(agent, "_sanitize_args_cursor", None)

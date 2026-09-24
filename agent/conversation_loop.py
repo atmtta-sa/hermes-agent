@@ -1420,6 +1420,17 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _annotate_request_budget_stop(agent: Any, result: Dict[str, Any]) -> None:
+    reason = getattr(agent, "_request_budget_stop_reason", None)
+    if reason:
+        result.update(
+            error=reason,
+            partial=True,
+            budget_exhausted=True,
+            stop_reason=reason,
+        )
+
+
 def _run_conversation_turn(
     agent,
     user_message: Any,
@@ -1496,6 +1507,7 @@ def _run_conversation_turn(
     agent._ephemeral_reasoning_off = False
     agent._auth_pool_refresh_counts = {}
     agent._last_turn_usage = None
+    agent._request_budget_stop_reason = None
 
     s = _LoopState(
         system_message=system_message, moa_config=moa_config,
@@ -1514,7 +1526,8 @@ def _run_conversation_turn(
     while (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         if _run_phase(begin_iteration, agent, s).action == "break":
             break
-        _run_phase(prepare_iteration, agent, s)
+        if _run_phase(prepare_iteration, agent, s).action == "stop":
+            break
         _run_phase(assemble_api_request, agent, s)
         _pg = _run_phase(run_preflight_gate, agent, s)
         if _pg.action == "return":
@@ -1563,6 +1576,7 @@ def _run_conversation_turn(
         name: getattr(s, name)
         for name in inspect.signature(finalize_turn).parameters if name != "agent"
     })
+    _annotate_request_budget_stop(agent, result)
     if s._compression_timeout_exhausted:
         # Reuse the gateway's context-recovery contract: transcript stays intact while
         # future input can move to a clean session (#98722).
