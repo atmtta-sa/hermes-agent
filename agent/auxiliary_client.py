@@ -108,7 +108,7 @@ def aux_probe_mode():
 
 from agent.credential_pool import load_pool
 from agent.model_metadata import (
-    MINIMUM_CONTEXT_LENGTH, get_model_context_length,
+    MINIMUM_CONTEXT_LENGTH, get_model_context_length, parse_available_output_tokens_from_error,
     strip_codex_context_variant_suffix as _strip_codex_ctx_variant,
 )
 from hermes_cli.config import get_hermes_home
@@ -6671,6 +6671,29 @@ def _credential_rung_accepts(exc: Exception) -> bool:
     return _is_auth_error(exc) or _is_payment_error(exc) or _is_rate_limit_error(exc)
 
 
+def _ladder_affordability_rung(
+    first_err: Exception, route: "_LadderRoute", kwargs: Dict[str, Any],
+):
+    """Retry one parseable provider affordability limit with a bounded output cap."""
+    available_output = parse_available_output_tokens_from_error(str(first_err))
+    if available_output is None:
+        return None, first_err, kwargs
+    retry_kwargs = dict(kwargs)
+    retry_kwargs.pop("max_tokens", None)
+    retry_kwargs.pop("max_completion_tokens", None)
+    safe_output = max(1, available_output - 64)
+    retry_kwargs.update(auxiliary_max_tokens_param(safe_output, model=kwargs.get("model")))
+    logger.info(
+        "Auxiliary %s%s: provider output cap is unaffordable; retrying once with max_tokens=%d",
+        route.task or "call", route.tag, safe_output,
+    )
+    response, retry_err = yield from _rung(
+        _LadderStep("call", (route.client, retry_kwargs)),
+        lambda exc: _is_payment_error(exc) or _is_connection_error(exc) or _is_rate_limit_error(exc),
+    )
+    return response, retry_err, retry_kwargs
+
+
 # Immutable route context shared by the recovery rungs.
 _LadderRoute = NamedTuple("_LadderRoute", [
     ("client", Any), ("task", Optional[str]), ("tag", str), ("async_mode", bool), ("base_info", str),
@@ -6923,9 +6946,14 @@ def _aux_recovery_ladder(
     route = _LadderRoute(
         client, task, tag, async_mode, base_info, resolved_provider, resolved_model,
         resolved_base_url, resolved_api_key, resolved_api_mode, final_model, main_runtime, route_info)
-    resp, first_err, kwargs = yield from _ladder_parameter_rungs(first_err, route, kwargs, max_tokens)
-    if first_err is None:
+    resp, affordability_err, kwargs = yield from _ladder_affordability_rung(first_err, route, kwargs)
+    if affordability_err is None:
         return resp
+    first_err = affordability_err
+    resp, parameter_err, kwargs = yield from _ladder_parameter_rungs(first_err, route, kwargs, max_tokens)
+    if parameter_err is None:
+        return resp
+    first_err = parameter_err
     client_is_nous = (resolved_provider == "nous"
                       or base_url_host_matches(base_info, "inference-api.nousresearch.com"))
     resp, first_err = yield from _ladder_nous_rungs(first_err, route, kwargs, client_is_nous)
