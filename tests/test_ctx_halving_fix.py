@@ -56,6 +56,14 @@ class TestParseAvailableOutputTokens:
         msg = "max_tokens must be at most 10000 given your prompt (available tokens: 10000)"
         assert self._parse(msg) == 10000
 
+    def test_openrouter_affordability_limit(self):
+        """OpenRouter reports the affordable output cap without saying 'available tokens'."""
+        msg = (
+            "This request requires more credits, or fewer max_tokens. "
+            "You requested up to 131072 tokens, but can only afford 20208."
+        )
+        assert self._parse(msg) == 20208
+
 
     # ── Should NOT detect (returns None) ─────────────────────────────────
 
@@ -75,6 +83,53 @@ class TestParseAvailableOutputTokens:
     def test_rate_limit_error(self):
         msg = "rate_limit_error: too many requests per minute"
         assert self._parse(msg) is None
+
+    def test_openrouter_affordability_billing_routes_to_output_clamp(self):
+        from types import SimpleNamespace
+
+        from agent.error_classifier import FailoverReason
+        from agent.turn_recovery import route_classified_error
+
+        class BillingError(Exception):
+            status_code = 402
+
+        agent = MagicMock()
+        agent.compression_enabled = True
+        agent._fallback_index = 0
+        agent._fallback_chain = []
+        agent.provider = "openrouter"
+        classified = SimpleNamespace(reason=FailoverReason.billing, is_auth=False)
+        message = (
+            "This request requires more credits, or fewer max_tokens. "
+            "You requested up to 131072 tokens, but can only afford 20208."
+        )
+        error = BillingError(message)
+
+        verdict = route_classified_error(
+            agent,
+            error,
+            classified,
+            MagicMock(),
+            error_msg=message,
+            error_context=None,
+            recovered_with_pool=False,
+            base_url="https://openrouter.ai/api/v1",
+            model="moonshotai/kimi-k3",
+            messages=[],
+            api_messages=[],
+            system_message=None,
+            active_system_prompt=None,
+            conversation_history=[],
+            retry_count=1,
+            max_retries=3,
+            compression_attempts=0,
+            max_compression_attempts=3,
+            api_call_count=1,
+            effective_task_id=None,
+        )
+
+        assert verdict.action == "fallthrough"
+        assert verdict.wrapped_output_cap_budget == 20208
 
 
 # ---------------------------------------------------------------------------

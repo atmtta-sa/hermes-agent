@@ -1364,8 +1364,9 @@ def route_classified_error(
     # Eager fallback: rate-limit/billing switch immediately (primary won't recover in
     # the retry window); transport errors get 1 retry first.
     is_rate_limited = classified.reason in _RATE_LIMIT_REASONS
-    # Some relays wrap upstream output-cap 400s as 429 (rate_limit). Only the max_tokens
-    # clamp fixes it. Parsed once; gates the eager-fallback exemption and overflow entry.
+    # Some relays wrap upstream output-cap 400s as 429 (rate_limit), while OpenRouter
+    # reports an account-affordability output cap as 402 (billing). Only the max_tokens
+    # clamp fixes either parseable case. Parsed once; gates eager fallback and overflow entry.
     # Relay-wrapped output-cap errors: some gateways wrap an upstream "[400]: max_tokens (...) exceeds
     # model's maximum output tokens (...)" as HTTP 429, which classifies as rate_limit. The failure is a
     # deterministic request-shape problem — falling back to another provider (or burning generic retries)
@@ -1374,7 +1375,7 @@ def route_classified_error(
     # as available_out inside the handler.
     _wrapped_output_cap_budget = (
         parse_available_output_tokens_from_error(error_msg)
-        if classified.reason == FailoverReason.rate_limit else None
+        if classified.reason in {FailoverReason.rate_limit, FailoverReason.billing} else None
     )
     _is_transport_failure = classified.reason in _TRANSPORT_FAILURE_REASONS
     # Z.AI overload 429s classify `overloaded`, which `is_rate_limited` excludes. Detect

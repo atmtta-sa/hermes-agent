@@ -1098,6 +1098,7 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
     for pattern in (
         r'exceeds model(?:\'s)? maximum output tokens\s*\(?\s*(\d+)\s*\)?',
         r'range of max_tokens should be\s*\[\s*\d+\s*,\s*(\d+)\s*\]',
+        r'can only afford\s+(\d+)',
         r'available_tokens[:\s]+(\d+)',
         r'available\s+tokens[:\s]+(\d+)',
         r'=\s*(\d+)\s*$',
@@ -1154,6 +1155,7 @@ _INPUT_OVERFLOW_SIGNALS = (
 # real max-output cap ("Range of max_tokens should be [1, 65536]").
 _PARSEABLE_OUTPUT_CAP_SIGNALS = (
     ("max_tokens", "available_tokens"), ("max_tokens", "available tokens"),
+    ("max_tokens", "can only afford"),
     ("in the output", "maximum context length"),
     ("maximum context length", "requested", "output tokens"),
     ("range of max_tokens should be",), ("exceeds model", "maximum output tokens"),
