@@ -1,5 +1,9 @@
 """Regression contracts for pre-request paid-run budget enforcement."""
 
+import json
+import time
+
+from agent.agent_init import _load_autonomous_budget_envelope
 from agent.turn_iteration_prep import prepare_iteration
 
 
@@ -18,9 +22,18 @@ class _BudgetAgent:
     logger = None
     max_request_input_tokens = 64_000
     max_cumulative_input_tokens = 200_000
+    max_cumulative_output_tokens: int | None = 32_000
     max_model_requests_per_run = 8
+    max_run_seconds = 1_800
+    max_estimated_cost_usd = 1.0
+    max_tokens = 8_000
     session_input_tokens = 0
+    session_output_tokens = 0
     session_api_calls = 0
+    session_estimated_cost_usd = 0.0
+    _run_budget_started_at: float | None = None
+    autonomous_budget_required = False
+    _request_budget_stop_reason: str | None = None
 
     def _adopt_nous_key_before_expiry(self):
         return None
@@ -39,6 +52,7 @@ def test_stops_before_transmitting_request_above_input_ceiling():
     result = prepare_iteration(agent, messages=messages, api_call_count=1)
 
     assert result.action == "stop"
+    assert agent._request_budget_stop_reason == "prompt_budget_exhausted"
 
 
 def test_stops_before_request_when_cumulative_input_budget_is_exhausted():
@@ -52,6 +66,7 @@ def test_stops_before_request_when_cumulative_input_budget_is_exhausted():
     )
 
     assert result.action == "stop"
+    assert agent._request_budget_stop_reason == "run_token_budget_exhausted"
 
 
 def test_stops_before_request_when_model_request_budget_is_exhausted():
@@ -65,3 +80,152 @@ def test_stops_before_request_when_model_request_budget_is_exhausted():
     )
 
     assert result.action == "stop"
+    assert agent._request_budget_stop_reason == "run_request_budget_exhausted"
+
+
+def test_stops_before_request_that_would_cross_cumulative_input_budget():
+    agent = _BudgetAgent()
+    agent.session_input_tokens = 199_999
+
+    result = prepare_iteration(
+        agent,
+        messages=[{"role": "user", "content": "continue with enough text to consume tokens"}],
+        api_call_count=2,
+    )
+
+    assert result.action == "stop"
+    assert agent._request_budget_stop_reason == "run_token_budget_exhausted"
+
+
+def test_stops_before_request_when_cumulative_output_budget_is_exhausted():
+    agent = _BudgetAgent()
+    agent.session_output_tokens = 32_000
+
+    result = prepare_iteration(
+        agent,
+        messages=[{"role": "user", "content": "continue"}],
+        api_call_count=2,
+    )
+
+    assert result.action == "stop"
+    assert agent._request_budget_stop_reason == "run_token_budget_exhausted"
+
+
+def test_stops_before_request_when_hard_wall_time_is_exhausted():
+    agent = _BudgetAgent()
+    agent._run_budget_started_at = time.time() - agent.max_run_seconds - 1
+
+    result = prepare_iteration(
+        agent,
+        messages=[{"role": "user", "content": "continue"}],
+        api_call_count=2,
+    )
+
+    assert result.action == "stop"
+    assert agent._request_budget_stop_reason == "run_time_budget_exhausted"
+
+
+def test_paid_autonomous_request_requires_complete_explicit_envelope():
+    agent = _BudgetAgent()
+    agent.autonomous_budget_required = True
+    agent.max_cumulative_output_tokens = None
+
+    result = prepare_iteration(
+        agent,
+        messages=[{"role": "user", "content": "continue"}],
+        api_call_count=1,
+    )
+
+    assert result.action == "stop"
+    assert agent._request_budget_stop_reason == "autonomous_budget_missing"
+
+
+def test_stops_before_request_that_would_cross_cost_budget(monkeypatch):
+    agent = _BudgetAgent()
+    agent.session_estimated_cost_usd = 0.80
+    monkeypatch.setattr(
+        "agent.turn_iteration_prep._estimate_request_cost_usd",
+        lambda _agent, _input_tokens, _output_tokens: 0.25,
+        raising=False,
+    )
+
+    result = prepare_iteration(
+        agent,
+        messages=[{"role": "user", "content": "continue"}],
+        api_call_count=2,
+    )
+
+    assert result.action == "stop"
+    assert agent._request_budget_stop_reason == "cost_budget_exhausted"
+
+
+def test_paid_autonomous_request_stops_when_cost_cannot_be_estimated(monkeypatch):
+    agent = _BudgetAgent()
+    agent.autonomous_budget_required = True
+    monkeypatch.setattr(
+        "agent.turn_iteration_prep._estimate_request_cost_usd",
+        lambda _agent, _input_tokens, _output_tokens: None,
+        raising=False,
+    )
+
+    result = prepare_iteration(
+        agent,
+        messages=[{"role": "user", "content": "continue"}],
+        api_call_count=1,
+    )
+
+    assert result.action == "stop"
+    assert agent._request_budget_stop_reason == "cost_budget_exhausted"
+
+
+def test_non_paperclip_run_does_not_require_autonomous_envelope():
+    required, limits = _load_autonomous_budget_envelope({})
+
+    assert required is False
+    assert limits == {}
+
+
+def test_paperclip_run_without_envelope_fails_closed():
+    required, limits = _load_autonomous_budget_envelope({"PAPERCLIP_RUN_ID": "run-1"})
+
+    assert required is True
+    assert limits == {}
+
+
+def test_paperclip_envelope_maps_all_reserved_dimensions():
+    required, limits = _load_autonomous_budget_envelope(
+        {
+            "PAPERCLIP_RUN_ID": "run-1",
+            "HERMES_AUTONOMOUS_BUDGET_JSON": json.dumps(
+                {
+                    "requestCount": 8,
+                    "inputTokens": 200_000,
+                    "outputTokens": 32_000,
+                    "runtimeMs": 900_000,
+                    "costMicrousd": 250_000,
+                }
+            ),
+        }
+    )
+
+    assert required is True
+    assert limits == {
+        "max_request_input_tokens": 64_000,
+        "max_cumulative_input_tokens": 200_000,
+        "max_cumulative_output_tokens": 32_000,
+        "max_model_requests_per_run": 8,
+        "max_run_seconds": 900.0,
+        "max_estimated_cost_usd": 0.25,
+    }
+
+
+def test_malformed_paperclip_envelope_cannot_apply_partial_limits():
+    required, limits = _load_autonomous_budget_envelope(
+        {
+            "PAPERCLIP_RUN_ID": "run-1",
+            "HERMES_AUTONOMOUS_BUDGET_JSON": '{"requestCount": 8}',
+        }
+    )
+
+    assert required is True
+    assert limits == {}
