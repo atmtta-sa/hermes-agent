@@ -139,6 +139,48 @@ def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | No
     return valid, None
 
 
+def _usage_telemetry_complete(result: dict, api_calls: int) -> bool:
+    return api_calls == 0 or (
+        result.get("input_tokens") is not None
+        and result.get("output_tokens") is not None
+    )
+
+
+def _successful_provider_responses(result: dict, api_calls: int) -> int:
+    provider_responses_raw = result.get("successful_provider_responses")
+    return (
+        provider_responses_raw
+        if isinstance(provider_responses_raw, int) and not isinstance(provider_responses_raw, bool)
+        else api_calls
+    )
+
+
+def _default_work_outcome(*, failed: bool, api_calls: int, telemetry_complete: bool) -> str:
+    if failed:
+        return "provider_error"
+    if api_calls == 0:
+        return "no_progress"
+    return "provider_completed" if telemetry_complete else "telemetry_missing"
+
+
+def _usage_outcome_fields(result: dict, failure: Optional[str]) -> dict:
+    failed = bool(result.get("failed")) or failure is not None
+    api_calls = int(result.get("api_calls") or 0)
+    telemetry_complete = _usage_telemetry_complete(result, api_calls)
+    default_outcome = _default_work_outcome(
+        failed=failed,
+        api_calls=api_calls,
+        telemetry_complete=telemetry_complete,
+    )
+    return {
+        "failed": failed,
+        "process_status": "failed" if failed else "succeeded",
+        "work_outcome": result.get("work_outcome") or default_outcome,
+        "successful_provider_responses": _successful_provider_responses(result, api_calls),
+        "telemetry_complete": telemetry_complete,
+    }
+
+
 def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] = None) -> None:
     """Best-effort JSON usage report for pipelines (``-z --usage-file``).
 
@@ -149,7 +191,7 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         return
     try:
         report = {key: result.get(key) for key in _USAGE_KEYS}
-        report["failed"] = bool(result.get("failed")) or failure is not None
+        report.update(_usage_outcome_fields(result, failure))
         report["service_tier"] = result.get("service_tier")
         if failure is not None:
             report["failure"] = failure
