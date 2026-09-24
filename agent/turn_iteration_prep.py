@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import random
 import sys
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Dict
@@ -95,30 +96,133 @@ def _positive_int(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
-def _request_budget_stop_reason(agent: Any, messages: Any) -> str | None:
-    """Return a fail-closed reason when an explicit request/run ceiling is exhausted."""
-    counters = (
-        ("max_model_requests_per_run", "session_api_calls", "model_request_budget_exhausted"),
-        ("max_cumulative_input_tokens", "session_input_tokens", "run_input_token_budget_exhausted"),
-    )
-    for limit_name, used_name, reason in counters:
-        limit = _positive_int(getattr(agent, limit_name, None))
-        if limit is not None and int(getattr(agent, used_name, 0) or 0) >= limit:
-            return reason
-
-    request_input_limit = _positive_int(getattr(agent, "max_request_input_tokens", None))
-    if request_input_limit is None:
+def _positive_float(value: Any) -> float | None:
+    if isinstance(value, bool):
         return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _estimate_request_cost_usd(
+    agent: Any,
+    input_tokens: int,
+    output_tokens: int,
+) -> float | None:
+    """Price the pessimistic next-request envelope with the normal Hermes rate card."""
+    try:
+        from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+
+        result = estimate_usage_cost(
+            getattr(agent, "model", ""),
+            CanonicalUsage(input_tokens=input_tokens, output_tokens=output_tokens),
+            provider=getattr(agent, "provider", None),
+            base_url=getattr(agent, "base_url", None),
+            api_key=getattr(agent, "api_key", ""),
+        )
+        return float(result.amount_usd) if result.amount_usd is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+_AUTONOMOUS_BUDGET_FIELDS = (
+    "max_request_input_tokens",
+    "max_cumulative_input_tokens",
+    "max_cumulative_output_tokens",
+    "max_model_requests_per_run",
+    "max_run_seconds",
+    "max_estimated_cost_usd",
+)
+
+
+def _missing_budget_envelope_reason(agent: Any) -> str | None:
+    if not getattr(agent, "autonomous_budget_required", False):
+        return None
+    if any(getattr(agent, name, None) is None for name in _AUTONOMOUS_BUDGET_FIELDS):
+        return "autonomous_budget_missing"
+    return None
+
+
+def _consumed_budget_stop_reason(agent: Any) -> str | None:
+    request_limit = _positive_int(getattr(agent, "max_model_requests_per_run", None))
+    used_requests = int(getattr(agent, "session_api_calls", 0) or 0)
+    if request_limit is not None and used_requests >= request_limit:
+        return "run_request_budget_exhausted"
+
+    output_limit = _positive_int(getattr(agent, "max_cumulative_output_tokens", None))
+    used_output = int(getattr(agent, "session_output_tokens", 0) or 0)
+    if output_limit is not None and used_output >= output_limit:
+        return "run_token_budget_exhausted"
+    return None
+
+
+def _time_budget_stop_reason(agent: Any) -> str | None:
+    run_seconds = _positive_int(getattr(agent, "max_run_seconds", None))
+    started_at = getattr(agent, "_run_budget_started_at", None)
+    if run_seconds is None or not isinstance(started_at, (int, float)):
+        return None
+    if time.time() - float(started_at) >= run_seconds:
+        return "run_time_budget_exhausted"
+    return None
+
+
+def _fixed_budget_stop_reason(agent: Any) -> str | None:
+    return (
+        _missing_budget_envelope_reason(agent)
+        or _consumed_budget_stop_reason(agent)
+        or _time_budget_stop_reason(agent)
+    )
+
+
+def _estimated_request_input_tokens(agent: Any, messages: Any) -> int:
     from agent.model_metadata import estimate_request_tokens_rough
 
-    estimated = estimate_request_tokens_rough(
+    return estimate_request_tokens_rough(
         messages,
         system_prompt=str(getattr(agent, "system_message", "") or ""),
         tools=getattr(agent, "tools", None) or None,
     )
-    if estimated > request_input_limit:
-        return "request_input_token_budget_exhausted"
+
+
+def _input_budget_stop_reason(agent: Any, estimated: int) -> str | None:
+    request_limit = _positive_int(getattr(agent, "max_request_input_tokens", None))
+    if request_limit is not None and estimated > request_limit:
+        return "prompt_budget_exhausted"
+
+    cumulative_limit = _positive_int(getattr(agent, "max_cumulative_input_tokens", None))
+    used = int(getattr(agent, "session_input_tokens", 0) or 0)
+    if cumulative_limit is not None and used + estimated > cumulative_limit:
+        return "run_token_budget_exhausted"
     return None
+
+
+def _cost_budget_stop_reason(agent: Any, estimated_input: int) -> str | None:
+    limit = _positive_float(getattr(agent, "max_estimated_cost_usd", None))
+    if limit is None:
+        return None
+    remaining_output = max(
+        0,
+        int(getattr(agent, "max_cumulative_output_tokens", 0) or 0)
+        - int(getattr(agent, "session_output_tokens", 0) or 0),
+    )
+    configured_output = _positive_int(getattr(agent, "max_tokens", None))
+    projected_output = min(configured_output, remaining_output) if configured_output else remaining_output
+    projected_cost = _estimate_request_cost_usd(agent, estimated_input, projected_output)
+    used = float(getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0)
+    if projected_cost is None or used + projected_cost > limit:
+        return "cost_budget_exhausted"
+    return None
+
+
+def _request_budget_stop_reason(agent: Any, messages: Any) -> str | None:
+    """Return a fail-closed reason when an explicit request/run ceiling is exhausted."""
+    fixed_reason = _fixed_budget_stop_reason(agent)
+    if fixed_reason:
+        return fixed_reason
+    estimated = _estimated_request_input_tokens(agent, messages)
+    return _input_budget_stop_reason(agent, estimated) or _cost_budget_stop_reason(agent, estimated)
 
 
 def _request_budget_stop_verdict(agent: Any, messages: Any, request_logger: Any) -> IterationPrep | None:

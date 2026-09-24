@@ -7021,6 +7021,12 @@ def _stamp_latency_once(latency_info: Optional[Dict[str, int]], key: str, starte
         latency_info[key] = _elapsed_ms(started_at)
 
 
+def _deny_unreserved_autonomous_auxiliary_call() -> None:
+    """Block paid side calls that are not represented in Paperclip's run reservation."""
+    if os.getenv("PAPERCLIP_RUN_ID") and os.getenv("HERMES_AUTONOMOUS_BUDGET_JSON"):
+        raise RuntimeError("autonomous_auxiliary_budget_unreserved")
+
+
 @_relay_auxiliary_call
 def call_llm(
     task: str = None, *, provider: str = None, model: str = None, base_url: str = None,
@@ -7032,6 +7038,7 @@ def call_llm(
     latency_info: Optional[Dict[str, int]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
+    _deny_unreserved_autonomous_auxiliary_call()
     queue_started_at = time.monotonic()
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
@@ -7330,6 +7337,7 @@ async def async_call_llm(
     route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
+    _deny_unreserved_autonomous_auxiliary_call()
     semaphore = _acquire_async_aux_semaphore(task)
     if semaphore is not None:
         await semaphore.acquire()
