@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -201,3 +202,29 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     assert ("claim", "cli", True) in calls
     assert ("run", "hello", []) in calls
     assert calls[-1] == ("finalize", "quiet-session")
+
+
+def test_quiet_single_query_writes_typed_rollover_result(monkeypatch, tmp_path):
+    import cli as cli_mod
+
+    target = tmp_path / "run-result.json"
+    monkeypatch.setenv("HERMES_RUN_RESULT_FILE", str(target))
+    cli_mod._write_quiet_result_file(
+        {
+            "failed": True,
+            "partial": True,
+            "stop_reason": "session_rollover_required",
+            "turn_exit_reason": "session_rollover_required",
+            "final_response": "must not be persisted",
+        },
+        "session-before-rollover",
+    )
+
+    assert json.loads(target.read_text()) == {
+        "failed": True,
+        "partial": True,
+        "session_id": "session-before-rollover",
+        "stop_reason": "session_rollover_required",
+        "turn_exit_reason": "session_rollover_required",
+        "version": 1,
+    }

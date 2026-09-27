@@ -1400,7 +1400,10 @@ def _annotate_request_budget_stop(agent: Any, result: Dict[str, Any]) -> None:
             partial=True,
             budget_exhausted=True,
             stop_reason=reason,
+            turn_exit_reason=reason,
         )
+        if reason == "session_rollover_required":
+            result["failed"] = True
 
 
 def run_conversation(

@@ -4053,6 +4053,32 @@ def _sync_cli_session_id_from_agent(cli) -> None:
         cli.session_id = cli.agent.session_id
 
 
+def _write_quiet_result_file(result: object, session_id: str) -> None:
+    """Best-effort machine metadata for an explicitly configured automation caller."""
+    target = os.environ.get("HERMES_RUN_RESULT_FILE", "").strip()
+    if not target:
+        return
+    record = result if isinstance(result, dict) else {}
+    payload = {
+        "version": 1,
+        "session_id": session_id,
+        "stop_reason": record.get("stop_reason"),
+        "turn_exit_reason": record.get("turn_exit_reason"),
+        "failed": bool(record.get("failed")),
+        "partial": bool(record.get("partial")),
+    }
+    path = Path(target).expanduser()
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.replace(path)
+    except OSError as exc:
+        logger.warning("Could not write Hermes run result file %s: %s", path, exc)
+        with suppress(OSError):
+            temporary.unlink()
+
+
 def _run_quiet_single_query(cli, effective_query):
     """Quiet (-Q) one-shot turn: run, print the response (stderr for errors/session_id), then sys.exit with the automation exit code."""
     try:
@@ -4084,6 +4110,7 @@ def _run_quiet_single_query(cli, effective_query):
             logger.debug("kanban goal loop failed: %s", _goal_exc)
 
     print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+    _write_quiet_result_file(result, cli.session_id)
 
     # Exit code 0/1 for automation wrappers. Kanban workers that failed purely on
     # rate-limit/billing exit with the EX_TEMPFAIL sentinel so the dispatcher releases

@@ -187,14 +187,19 @@ def _estimated_request_input_tokens(agent: Any, messages: Any) -> int:
 
 
 def _input_budget_stop_reason(agent: Any, estimated: int) -> str | None:
+    rollover_reason = (
+        "session_rollover_required"
+        if getattr(agent, "autonomous_budget_required", False)
+        else None
+    )
     request_limit = _positive_int(getattr(agent, "max_request_input_tokens", None))
     if request_limit is not None and estimated > request_limit:
-        return "prompt_budget_exhausted"
+        return rollover_reason or "prompt_budget_exhausted"
 
     cumulative_limit = _positive_int(getattr(agent, "max_cumulative_input_tokens", None))
     used = int(getattr(agent, "session_input_tokens", 0) or 0)
     if cumulative_limit is not None and used + estimated > cumulative_limit:
-        return "run_token_budget_exhausted"
+        return rollover_reason or "run_token_budget_exhausted"
     return None
 
 
