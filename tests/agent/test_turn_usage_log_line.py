@@ -38,6 +38,7 @@ def test_write_id_and_upstream_are_on_the_line(tmp_path, monkeypatch, caplog):
     assert " cache=34283/62889 (55%)" in line
     assert " write=28604" in line
     assert " id=gen-1788636728-qMa1SbYZcwjrvUzJuF1g" in line
+    assert getattr(a, "session_provider_request_ids") == ["gen-1788636728-qMa1SbYZcwjrvUzJuF1g"]
     assert " upstream=Anthropic" in line
     # the pre-existing prefix is unchanged, so older parsers keep matching
     assert line.startswith("API call #1: model=anthropic/claude-fable-5.1 provider=nous in=62889 out=7 total=62896 latency=0.2s")
@@ -50,6 +51,106 @@ def test_fields_are_omitted_when_absent(tmp_path, monkeypatch, caplog):
     finally:
         a.close()
     assert "write=" not in line and "id=" not in line and "upstream=" not in line
+
+
+def test_response_evidence_tracks_missing_usage_separately(tmp_path, monkeypatch, caplog):
+    a = _agent(tmp_path, monkeypatch)
+    try:
+        _line(a, caplog, SimpleNamespace(usage=None, id="response-without-usage"))
+        assert a.session_successful_provider_responses == 1
+        assert a.session_usage_missing_responses == 1
+        assert getattr(a, "session_provider_request_ids") == ["response-without-usage"]
+        _line(a, caplog, SimpleNamespace(usage=_usage(0, 0, 100)))
+        assert a.session_successful_provider_responses == 2
+        assert a.session_usage_missing_responses == 1
+    finally:
+        a.close()
+
+
+def test_unknown_cost_remains_incomplete_after_later_priced_response(tmp_path, monkeypatch, caplog):
+    a = _agent(tmp_path, monkeypatch)
+    from agent import turn_usage
+
+    prices = iter([
+        SimpleNamespace(amount_usd=None, status="unknown", source="none"),
+        SimpleNamespace(amount_usd=0.01, status="estimated", source="test"),
+    ])
+    monkeypatch.setattr(turn_usage, "estimate_usage_cost", lambda *_args, **_kwargs: next(prices))
+    try:
+        _line(a, caplog, SimpleNamespace(usage=_usage(0, 0, 100)))
+        _line(a, caplog, SimpleNamespace(usage=_usage(0, 0, 100)))
+        assert getattr(a, "session_cost_missing_responses") == 1
+        assert a.session_cost_status == "estimated"
+        assert a.session_estimated_cost_usd == 0.01
+    finally:
+        a.close()
+
+
+def test_estimated_cost_provenance_survives_later_reported_response(tmp_path, monkeypatch, caplog):
+    a = _agent(tmp_path, monkeypatch)
+    from agent import turn_usage
+
+    prices = iter([
+        SimpleNamespace(amount_usd=0.01, status="estimated", source="test"),
+        SimpleNamespace(amount_usd=0.02, status="actual", source="provider"),
+    ])
+    monkeypatch.setattr(turn_usage, "estimate_usage_cost", lambda *_args, **_kwargs: next(prices))
+    try:
+        _line(a, caplog, SimpleNamespace(usage=_usage(0, 0, 100)))
+        _line(a, caplog, SimpleNamespace(usage=_usage(0, 0, 100)))
+        assert getattr(a, "session_cost_estimated_responses") == 1
+        assert a.session_cost_status == "actual"
+    finally:
+        a.close()
+
+
+def test_openrouter_response_charge_overrides_estimate_only_on_verified_route(tmp_path, monkeypatch, caplog):
+    from agent import turn_usage
+    monkeypatch.setattr(
+        turn_usage, "estimate_usage_cost",
+        lambda *_args, **_kwargs: SimpleNamespace(amount_usd=0.01, status="estimated", source="test"),
+    )
+    for base_url, expected_cost, expected_status in (
+        ("https://openrouter.ai/api/v1", 0.00017, "actual"),
+        ("https://openrouter.ai.evil.example/api/v1", 0.01, "estimated"),
+    ):
+        agent = _agent(tmp_path, monkeypatch)
+        agent.base_url = base_url
+        usage = _usage(0, 0, 100)
+        usage.cost = 0.00017
+        try:
+            _line(agent, caplog, SimpleNamespace(usage=usage, id="gen-1"))
+            assert agent.session_estimated_cost_usd == expected_cost
+            assert agent.session_cost_status == expected_status
+            assert agent.session_cost_estimated_responses == (expected_status != "actual")
+        finally:
+            agent.close()
+
+
+def test_openrouter_aggregator_charge_cannot_certify_estimated_advisor_spend(tmp_path, monkeypatch, caplog):
+    from agent import turn_usage
+    agent = _agent(tmp_path, monkeypatch)
+    agent.base_url = "https://openrouter.ai/api/v1"
+    monkeypatch.setattr(
+        turn_usage, "_fold_moa_usage",
+        lambda _agent, usage: (None, usage, 0.004),
+    )
+    usage = _usage(0, 0, 100)
+    usage.cost = 0.00017
+    try:
+        _line(agent, caplog, SimpleNamespace(usage=usage, id="gen-1"))
+        assert agent.session_cost_estimated_responses == 1
+    finally:
+        agent.close()
+
+
+def test_synthetic_stream_id_is_not_provider_request_evidence(tmp_path, monkeypatch, caplog):
+    agent = _agent(tmp_path, monkeypatch)
+    try:
+        _line(agent, caplog, SimpleNamespace(usage=_usage(0, 0, 100), id="stream-1234"))
+        assert agent.session_provider_request_ids == []
+    finally:
+        agent.close()
 
 
 def test_forensics_parser_reads_the_new_fields(tmp_path):

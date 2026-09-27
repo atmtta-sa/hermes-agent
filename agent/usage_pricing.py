@@ -6,6 +6,7 @@ from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Literal, Optional
+from urllib.parse import urlparse
 
 from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
 from utils import base_url_host_matches, base_url_hostname
@@ -543,6 +544,19 @@ def normalize_usage(
         input_tokens=input_tokens, output_tokens=output_tokens, cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens, reasoning_tokens=reasoning_tokens,
     )
+
+
+def provider_reported_usage_cost(usage: Any, *, base_url: str) -> CostResult | None:
+    """Accept OpenRouter's charge only from its HTTPS API response, not a local estimate."""
+    if not base_url_host_matches(base_url, "openrouter.ai") or urlparse(base_url).scheme != "https":
+        return None
+    amount = usage.get("cost") if isinstance(usage, dict) else getattr(usage, "cost", None)
+    if isinstance(amount, bool) or not isinstance(amount, (int, float, Decimal)):
+        return None
+    value = Decimal(str(amount))
+    if not value.is_finite() or value < _ZERO:
+        return None
+    return CostResult(value, "actual", "provider_cost_api", format_cost_label(value))
 
 
 def _unknown_cost(source: CostSource, *notes: str) -> CostResult:

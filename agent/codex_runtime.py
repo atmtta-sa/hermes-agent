@@ -89,12 +89,15 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
     the main loop's capture, and the mirror is never compacted natively, so without an anchor the rough
     estimate grows monotonically and hermes-mode fires thread compaction on tiny threads (#100381)."""
     agent.session_api_calls += 1
+    agent.session_successful_provider_responses = getattr(agent, "session_successful_provider_responses", 0) + 1
     usage = getattr(turn, "token_usage_last", None)
     compressor = getattr(agent, "context_compressor", None)
 
     def billing(**extra):
         return dict(model=agent.model, billing_provider=agent.provider, billing_base_url=agent.base_url, api_call_count=1, **extra)
     if not isinstance(usage, dict) or not usage:
+        agent.session_usage_missing_responses = getattr(agent, "session_usage_missing_responses", 0) + 1
+        agent.session_cost_missing_responses = getattr(agent, "session_cost_missing_responses", 0) + 1
         if compressor is not None and getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage cannot adjudicate the pending compaction; unlatch preflight deferral.
             compressor.update_from_response({})
@@ -138,6 +141,10 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
     if cost_usd is not None:
         agent.session_estimated_cost_usd += cost_usd
     agent.session_cost_status, agent.session_cost_source = cost_result.status, cost_result.source
+    if cost_result.amount_usd is None:
+        agent.session_cost_missing_responses = getattr(agent, "session_cost_missing_responses", 0) + 1
+    elif cost_result.status not in {"actual", "included"}:
+        agent.session_cost_estimated_responses = getattr(agent, "session_cost_estimated_responses", 0) + 1
     cost_fields = {"estimated_cost_usd": cost_usd, "cost_status": cost_result.status, "cost_source": cost_result.source}
     _queue_token_counts(
         agent, "Codex app-server token persistence failed (session=%s, tokens=%d): %s", total_tokens,

@@ -7,9 +7,38 @@ from agent.usage_pricing import (
     estimate_usage_cost,
     get_pricing_entry,
     normalize_usage,
+    provider_reported_usage_cost,
     resolve_billing_route,
 )
 from decimal import Decimal
+from openai.types.completion_usage import CompletionUsage
+
+
+def test_provider_reported_openrouter_cost_requires_trusted_route_and_amount():
+    charged = provider_reported_usage_cost(
+        CompletionUsage.model_validate({"prompt_tokens": 100, "completion_tokens": 20,
+                                        "total_tokens": 120, "cost": 0.00017}),
+        base_url="https://openrouter.ai/api/v1"
+    )
+    assert charged is not None
+    assert (charged.amount_usd, charged.status, charged.source) == (
+        Decimal("0.00017"), "actual", "provider_cost_api"
+    )
+    assert provider_reported_usage_cost(
+        SimpleNamespace(cost=0), base_url="https://openrouter.ai/api/v1"
+    ).amount_usd == Decimal("0")
+    for base_url, value in (
+        ("https://openrouter.ai.evil.example/api/v1", 0.1),
+        ("http://openrouter.ai/api/v1", 0.1),
+        ("https://api.openai.com/v1", 0.1),
+        ("https://openrouter.ai/api/v1", None),
+        ("https://openrouter.ai/api/v1", -0.1),
+        ("https://openrouter.ai/api/v1", float("nan")),
+        ("https://openrouter.ai/api/v1", "0.1"),
+        ("https://openrouter.ai/api/v1", True),
+    ):
+        assert provider_reported_usage_cost(SimpleNamespace(cost=value), base_url=base_url) is None
+
 
 
 def test_astra_whole_request_price_tier_includes_cache_writes():

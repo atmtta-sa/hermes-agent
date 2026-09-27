@@ -11,13 +11,14 @@ model/provider. Logger name stays ``agent.conversation_loop`` for caplog parity.
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from agent.image_token_cost import calibrate_from_usage
 from agent.usage_anchor import capture_usage_anchor, set_usage_anchor
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import estimate_usage_cost, normalize_usage, provider_reported_usage_cost
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -63,6 +64,78 @@ def _fold_moa_usage(agent, canonical_usage):
     return _moa_client, canonical_usage, _moa_ref_cost
 
 
+def _aggregator_cost(agent, response, aggregator_usage, moa_client):
+    """Price at the real MoA aggregator route, preferring a provider-reported charge."""
+    model, provider, base_url = agent.model, agent.provider, agent.base_url
+    slot = getattr(moa_client, "last_aggregator_slot", None) if moa_client is not None else None
+    if slot and slot.get("model"):
+        model = slot["model"]
+        provider = slot.get("provider") or agent.provider
+        base_url = slot.get("base_url") or agent.base_url
+    return provider_reported_usage_cost(response.usage, base_url=base_url) or estimate_usage_cost(
+        model, aggregator_usage, provider=provider, base_url=base_url,
+        api_key=getattr(agent, "api_key", ""),
+    )
+
+
+def _advisor_cost(moa_ref_cost):
+    if moa_ref_cost is None:
+        return None
+    try:
+        return float(moa_ref_cost)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return None
+
+
+def _record_response_cost(agent, response, aggregator_usage, moa_client, moa_ref_cost):
+    """Price the aggregator; never certify a total containing estimated advisor spend."""
+    cost = _aggregator_cost(agent, response, aggregator_usage, moa_client)
+    delta = None
+    if cost.amount_usd is not None:
+        delta = float(cost.amount_usd)
+        agent.session_estimated_cost_usd += delta
+    advisor_cost = _advisor_cost(moa_ref_cost)
+    if advisor_cost is not None:
+        agent.session_estimated_cost_usd += advisor_cost
+        delta = (delta or 0.0) + advisor_cost
+    status = "estimated" if moa_ref_cost is not None and cost.status == "actual" else cost.status
+    source = "none" if status != cost.status else cost.source
+    agent.session_cost_status = status
+    agent.session_cost_source = source
+    if cost.amount_usd is None:
+        agent.session_cost_missing_responses += 1
+    elif status not in {"actual", "included"}:
+        agent.session_cost_estimated_responses += 1
+    return delta, status, source
+
+
+def _queue_response_usage(agent, canonical_usage, total_tokens, cost_delta, cost_status, cost_source):
+    """Queue the per-call delta without blocking the turn on session DB writes."""
+    if agent._session_db and agent.session_id:
+        try:
+            if not agent._session_db_created:
+                agent._ensure_db_session()
+            agent._session_db.queue_token_counts(
+                agent.session_id,
+                input_tokens=canonical_usage.input_tokens,
+                output_tokens=canonical_usage.output_tokens,
+                cache_read_tokens=canonical_usage.cache_read_tokens,
+                cache_write_tokens=canonical_usage.cache_write_tokens,
+                reasoning_tokens=canonical_usage.reasoning_tokens,
+                estimated_cost_usd=cost_delta,
+                cost_status=cost_status,
+                cost_source=cost_source,
+                billing_provider=agent.provider,
+                billing_base_url=agent.base_url,
+                billing_mode="subscription_included" if cost_status == "included" else None,
+                model=agent.model,
+                api_call_count=1,
+            )
+        except Exception as e:  # silent loss here undercounts analytics
+            logger.debug("Token persistence failed (session=%s, tokens=%d): %s",
+                         agent.session_id, total_tokens, e)
+
+
 def record_response_usage(
     agent: Any, response: Any, *, messages: List[Dict[str, Any]], api_call_count: int,
     api_duration: float, compression_attempts: int, max_compression_attempts: int,
@@ -76,7 +149,14 @@ def record_response_usage(
     # Token/cost accounting below stays gated on real usage, but the request itself
     # must remain observable.
     agent.session_api_calls += 1
+    agent.session_successful_provider_responses += 1
+    response_id = getattr(response, "id", None)
+    if (isinstance(response_id, str) and not response_id.startswith("stream-")
+            and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", response_id)):
+        agent.session_provider_request_ids.append(response_id)
     if not (hasattr(response, 'usage') and response.usage):
+        agent.session_usage_missing_responses += 1
+        agent.session_cost_missing_responses += 1
         if getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage -> cannot adjudicate the prior compaction; consume the
             # pending verdict so later readings aren't charged to it and
@@ -206,68 +286,11 @@ def record_response_usage(
             from agent.nous_wire import maybe_switch_wire_after_first_response
             maybe_switch_wire_after_first_response(agent, response, agent.session_api_calls)
 
-    # MoA: agent.model/provider are the virtual preset/"moa" with no pricing entry, silently
-    # dropping aggregator spend. Price at the REAL model/provider from the aggregator slot.
-    _agg_cost_model, _agg_cost_provider, _agg_cost_base_url = agent.model, agent.provider, agent.base_url
-    _agg_slot = getattr(_moa_client, "last_aggregator_slot", None) if _moa_client is not None else None
-    if _agg_slot and _agg_slot.get("model"):
-        _agg_cost_model = _agg_slot["model"]
-        _agg_cost_provider = _agg_slot.get("provider") or agent.provider
-        _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
-    cost_result = estimate_usage_cost(
-        _agg_cost_model, aggregator_usage, provider=_agg_cost_provider,
-        base_url=_agg_cost_base_url, api_key=getattr(agent, "api_key", ""),
+    # Price only the aggregator response; MoA advisors retain their own cost provenance.
+    cost_delta, cost_status, cost_source = _record_response_cost(
+        agent, response, aggregator_usage, _moa_client, _moa_ref_cost,
     )
-    # Cost delta = aggregator + MoA advisor cost (already priced per-advisor at each
-    # advisor's own model rate), so state.db's estimated_cost_usd matches the folded
-    # token counts.
-    _cost_delta = None
-    if cost_result.amount_usd is not None:
-        _cost_delta = float(cost_result.amount_usd)
-        agent.session_estimated_cost_usd += _cost_delta
-    if _moa_ref_cost is not None:
-        try:
-            _moa_cost = float(_moa_ref_cost)
-        except (TypeError, ValueError):  # pragma: no cover - defensive
-            _moa_cost = None
-        if _moa_cost is not None:
-            agent.session_estimated_cost_usd += _moa_cost
-            _cost_delta = (_cost_delta or 0.0) + _moa_cost
-    agent.session_cost_status = cost_result.status
-    agent.session_cost_source = cost_result.source
-
-    # Persist per-call token deltas for any session_id so non-CLI runs can't lose
-    # accounting; gateway/session-store writes use absolute totals and safely overwrite
-    # these deltas. Enqueued, not written (a cold state.db UPDATE here stalled the tool
-    # loop); drained at finalize via _persist_session.
-    if agent._session_db and agent.session_id:
-        try:
-            # Ensure the row exists: under concurrent SQLite load the initial
-            # _ensure_db_session() may fail, and UPDATE on a missing row affects 0 rows.
-            if not agent._session_db_created:
-                agent._ensure_db_session()
-            agent._session_db.queue_token_counts(
-                agent.session_id,
-                input_tokens=canonical_usage.input_tokens,
-                output_tokens=canonical_usage.output_tokens,
-                cache_read_tokens=canonical_usage.cache_read_tokens,
-                cache_write_tokens=canonical_usage.cache_write_tokens,
-                reasoning_tokens=canonical_usage.reasoning_tokens,
-                estimated_cost_usd=_cost_delta,
-                cost_status=cost_result.status,
-                cost_source=cost_result.source,
-                billing_provider=agent.provider,
-                billing_base_url=agent.base_url,
-                billing_mode="subscription_included"
-                if cost_result.status == "included" else None,
-                model=agent.model,
-                api_call_count=1,
-            )
-        except Exception as e:  # silent loss here undercounts analytics
-            logger.debug(
-                "Token persistence failed (session=%s, tokens=%d): %s",
-                agent.session_id, total_tokens, e,
-            )
+    _queue_response_usage(agent, canonical_usage, total_tokens, cost_delta, cost_status, cost_source)
 
     if agent.verbose_logging:
         logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
