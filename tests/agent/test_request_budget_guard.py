@@ -4,6 +4,7 @@ import json
 import time
 
 from agent.agent_init import _load_autonomous_budget_envelope
+from agent.conversation_loop import _annotate_request_budget_stop
 from agent.turn_iteration_prep import prepare_iteration
 
 
@@ -55,6 +56,28 @@ def test_stops_before_transmitting_request_above_input_ceiling():
     assert agent._request_budget_stop_reason == "prompt_budget_exhausted"
 
 
+def test_autonomous_prompt_overflow_requests_fresh_session_rollover():
+    agent = _BudgetAgent()
+    agent.autonomous_budget_required = True
+    messages = [{"role": "user", "content": "token " * 70_000}]
+
+    result = prepare_iteration(agent, messages=messages, api_call_count=1)
+
+    assert result.action == "stop"
+    assert agent._request_budget_stop_reason == "session_rollover_required"
+
+
+def test_rollover_result_exits_as_failure_for_paperclip_retry():
+    agent = _BudgetAgent()
+    agent._request_budget_stop_reason = "session_rollover_required"
+    result = {"failed": False, "final_response": "Unfinished work"}
+
+    _annotate_request_budget_stop(agent, result)
+
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "session_rollover_required"
+
+
 def test_stops_before_request_when_cumulative_input_budget_is_exhausted():
     agent = _BudgetAgent()
     agent.session_input_tokens = agent.max_cumulative_input_tokens
@@ -95,6 +118,21 @@ def test_stops_before_request_that_would_cross_cumulative_input_budget():
 
     assert result.action == "stop"
     assert agent._request_budget_stop_reason == "run_token_budget_exhausted"
+
+
+def test_autonomous_projected_cumulative_input_requests_fresh_session_rollover():
+    agent = _BudgetAgent()
+    agent.autonomous_budget_required = True
+    agent.session_input_tokens = 199_999
+
+    result = prepare_iteration(
+        agent,
+        messages=[{"role": "user", "content": "continue with enough text to consume tokens"}],
+        api_call_count=2,
+    )
+
+    assert result.action == "stop"
+    assert agent._request_budget_stop_reason == "session_rollover_required"
 
 
 def test_stops_before_request_when_cumulative_output_budget_is_exhausted():
