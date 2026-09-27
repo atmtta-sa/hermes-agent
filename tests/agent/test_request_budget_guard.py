@@ -267,3 +267,23 @@ def test_malformed_paperclip_envelope_cannot_apply_partial_limits():
 
     assert required is True
     assert limits == {}
+
+
+def test_paperclip_envelope_rejects_unknown_budget_dimension():
+    required, limits = _load_autonomous_budget_envelope(
+        {
+            "PAPERCLIP_RUN_ID": "run-1",
+            "HERMES_AUTONOMOUS_BUDGET_JSON": json.dumps(
+                {
+                    "requestCount": 8,
+                    "inputTokens": 64_000,
+                    "outputTokens": 8_000,
+                    "runtimeMs": 300_000,
+                    "costMicrousd": 250_000,
+                    "inputToken": 1,
+                }
+            ),
+        }
+    )
+    assert required is True
+    assert limits == {}

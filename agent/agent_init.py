@@ -338,6 +338,8 @@ def _load_autonomous_budget_envelope(
         "runtimeMs",
         "costMicrousd",
     )
+    if set(payload) != set(names):
+        return True, {}
     values = {name: payload.get(name) for name in names}
     if any(
         not isinstance(value, int) or isinstance(value, bool) or value <= 0
