@@ -540,6 +540,14 @@ def finalize_turn(
         "last_reasoning": _last_turn_reasoning(messages),
         "messages": messages,
         "api_calls": api_call_count,
+        "successful_provider_responses": min(
+            api_call_count, getattr(agent, "session_successful_provider_responses", 0)
+        ),
+        "provider_request_ids": list(getattr(agent, "session_provider_request_ids", [])),
+        "usage_telemetry_complete": (
+            getattr(agent, "session_usage_missing_responses", 0) == 0
+            and getattr(agent, "session_successful_provider_responses", 0) >= api_call_count
+        ),
         "completed": completed,
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
@@ -559,6 +567,12 @@ def finalize_turn(
             else getattr(agent.context_compressor, "last_prompt_tokens", 0)
         ) or 0,
         **{key: getattr(agent, f"session_{key}") for key in _SESSION_COST_KEYS},
+        **({"cost_status": "estimated", "cost_source": "mixed_estimated_responses"}
+           if getattr(agent, "session_cost_estimated_responses", 0) else {}),
+        # A sum of priced calls is not the total when any call had unknown cost.
+        # Keep per-call usage for audits, but never expose the partial sum as a run total.
+        **({"estimated_cost_usd": None, "cost_status": "unknown", "cost_source": "incomplete_responses"}
+           if getattr(agent, "session_cost_missing_responses", 0) else {}),
         # Requested service tier, for billing audits (`hermes -z --usage-file`).
         "service_tier": (
             (getattr(agent, "request_overrides", {}) or {}).get("extra_body") or {}

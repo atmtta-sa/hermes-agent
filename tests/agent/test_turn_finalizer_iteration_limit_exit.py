@@ -34,7 +34,12 @@ class _LimitAgent:
         self.session_prompt_tokens = 0
         self.session_completion_tokens = 0
         self.session_total_tokens = 0
-        self.session_estimated_cost_usd = 0
+        self.session_estimated_cost_usd = 0.0
+        self.session_successful_provider_responses = 0
+        self.session_usage_missing_responses = 0
+        self.session_cost_missing_responses = 0
+        self.session_cost_estimated_responses = 0
+        self.session_provider_request_ids: list[str] = []
         self.session_cost_status = "unknown"
         self.session_cost_source = "test"
         self._tool_guardrail_halt_decision = None
@@ -114,18 +119,56 @@ def _finalize(
     )
 
 
+def test_finalizer_separates_provider_response_from_missing_usage(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(max_iterations=60, budget_remaining=59)
+    agent.session_successful_provider_responses = 1
+    agent.session_usage_missing_responses = 1
+    result = _finalize(agent, final_response="response without usage", exit_reason="text_response(1)", api_call_count=1)
+    assert result["successful_provider_responses"] == 1
+    assert result["usage_telemetry_complete"] is False
 
 
+def test_finalizer_marks_aggregate_cost_unknown_after_one_unpriced_response(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(max_iterations=60, budget_remaining=59)
+    agent.session_successful_provider_responses = 2
+    agent.session_usage_missing_responses = 0
+    agent.session_cost_missing_responses = 1
+    agent.session_estimated_cost_usd = 0.01
+    agent.session_cost_status = "estimated"  # Last response had a price.
+    result = _finalize(agent, final_response="done", exit_reason="text_response(1)", api_call_count=2)
+    assert result["usage_telemetry_complete"] is True
+    assert result["cost_status"] == "unknown"
+    assert result["estimated_cost_usd"] is None
 
 
+def test_finalizer_does_not_call_mixed_estimated_and_reported_cost_reported(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(max_iterations=60, budget_remaining=59)
+    agent.session_successful_provider_responses = 2
+    agent.session_estimated_cost_usd = 0.01
+    agent.session_cost_status = "actual"  # Last response was provider-billed.
+    agent.session_cost_estimated_responses = 1
+    result = _finalize(agent, final_response="done", exit_reason="text_response(1)", api_call_count=2)
+    assert result["cost_status"] == "estimated"
 
 
+def test_finalizer_keeps_provider_response_ids_without_inventing_missing_ids(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(max_iterations=60, budget_remaining=59)
+    agent.session_successful_provider_responses = 2
+    agent.session_provider_request_ids = ["gen-provider-1"]
+    result = _finalize(agent, final_response="done", exit_reason="text_response(1)", api_call_count=2)
+    assert result["provider_request_ids"] == ["gen-provider-1"]
 
 
-
-
-
-
+def test_finalizer_zero_provider_responses_not_inferred_from_exit(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(max_iterations=60, budget_remaining=59)
+    result = _finalize(agent, final_response="compression paused", exit_reason="compression_cooldown", api_call_count=0)
+    assert result["successful_provider_responses"] == 0
+    assert result["usage_telemetry_complete"] is True
 
 
 @pytest.mark.parametrize(

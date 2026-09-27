@@ -4077,19 +4077,67 @@ def _sync_cli_session_id_from_agent(cli) -> None:
         cli.session_id = cli.agent.session_id
 
 
+def _quiet_endpoint_class(record: dict) -> str:
+    """Classify a known route without persisting host, path, query, or credentials."""
+    if record.get("provider") == "openai-codex" and not record.get("base_url"):
+        return "codex_app_server"
+    try:
+        parsed = urlparse(record.get("base_url") or "")
+        if parsed.scheme == "https" and parsed.hostname == "openrouter.ai":
+            return "openrouter_api"
+        if parsed.scheme == "https" and parsed.hostname == "api.openai.com":
+            return "openai_api"
+    except (TypeError, ValueError):
+        pass
+    return "unknown"
+
+
+def _quiet_usage_fields(record: dict) -> dict:
+    """Keep response evidence separate from token completeness."""
+    calls = record.get("api_calls") or 0
+    responses = record.get("successful_provider_responses") or 0
+    return {
+        "api_calls": calls,
+        "successful_provider_responses": responses,
+        "usage_telemetry_complete": bool(
+            record.get("usage_telemetry_complete")
+            and responses == calls
+            and (calls == 0 or (record.get("input_tokens") is not None and
+                                record.get("output_tokens") is not None))
+        ),
+        "input_tokens": record.get("input_tokens"),
+        "output_tokens": record.get("output_tokens"),
+        "cache_read_tokens": record.get("cache_read_tokens"),
+        "cache_write_tokens": record.get("cache_write_tokens"),
+    }
+
+
 def _write_quiet_result_file(result: object, session_id: str) -> None:
     """Best-effort machine metadata for an explicitly configured automation caller."""
     target = os.environ.get("HERMES_RUN_RESULT_FILE", "").strip()
     if not target:
         return
     record = result if isinstance(result, dict) else {}
+    priced_cost = record.get("cost_status") in {"estimated", "actual", "included"}
+    cost = record.get("estimated_cost_usd") if priced_cost else None
     payload = {
-        "version": 1,
+        "version": 2,
         "session_id": session_id,
         "stop_reason": record.get("stop_reason"),
         "turn_exit_reason": record.get("turn_exit_reason"),
         "failed": bool(record.get("failed")),
         "partial": bool(record.get("partial")),
+        "provider": record.get("provider"),
+        "model": record.get("model"),
+        "endpoint_class": _quiet_endpoint_class(record),
+        "provider_request_ids": [request_id for request_id in (record.get("provider_request_ids") or [])
+                                 if isinstance(request_id, str) and
+                                 re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id)],
+        **_quiet_usage_fields(record),
+        "estimated_cost_usd": cost,
+        "cost_unavailable_reason": None if cost is not None else "cost_not_reported",
+        "cost_status": record.get("cost_status"),
+        "cost_source": record.get("cost_source"),
     }
     path = Path(target).expanduser()
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
