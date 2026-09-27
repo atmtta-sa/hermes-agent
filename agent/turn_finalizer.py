@@ -16,6 +16,7 @@ from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
+from agent.turn_result import build_turn_result
 
 # Verification-continuation nudges (verify-on-stop / pre_verify) must be stripped from
 # returned/live history to avoid role-alternation breaks; the assistant response is
@@ -23,14 +24,6 @@ from agent.message_sanitization import _sanitize_surrogates
 _VERIFICATION_CONTINUATION_FLAGS = ("_verification_stop_synthetic", "_pre_verify_synthetic")
 
 _SENTENCE_END = {".", "!", "?", "。", "！", "？", "`", ")"}
-
-# ``result[key] = agent.session_<key>`` for the per-session usage/cost counters.
-_SESSION_TOKEN_KEYS = (
-    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
-    "reasoning_tokens", "prompt_tokens", "completion_tokens", "total_tokens",
-)
-_SESSION_COST_KEYS = ("estimated_cost_usd", "cost_status", "cost_source")
-
 
 def _assistant_row_missing_visible_text(msg: dict) -> bool:
     """True when an assistant row has no visible text (blank final or tool-only)."""
@@ -432,6 +425,98 @@ def _apply_output_hooks(
     return final_response, transformed, pre_transform
 
 
+def _review_skills_due(agent):
+    review_skills = (
+        agent._skill_nudge_interval > 0
+        and agent._iters_since_skill >= agent._skill_nudge_interval
+        and "skill_manage" in agent.valid_tool_names
+    )
+    if review_skills:
+        agent._iters_since_skill = 0
+    return review_skills
+
+
+def _maybe_review_after_delivery(agent, final_response, interrupted, messages, review_memory, review_skills):
+    if (
+        final_response
+        and not interrupted
+        and not getattr(agent, "skip_background_review", False)
+        and (review_memory or review_skills)
+    ):
+        with suppress(Exception):
+            agent._spawn_background_review(
+                messages_snapshot=list(messages), review_memory=review_memory,
+                review_skills=review_skills,
+            )
+
+
+def _complete_turn_delivery(
+    agent, result, *, final_response, original_user_message, interrupted, messages,
+    review_memory, logger, effective_task_id, turn_id, completed, failed, turn_exit_reason,
+    platform,
+):
+    # A /steer after the final assistant turn belongs to the next user turn.
+    leftover_steer = agent._drain_pending_steer()
+    if leftover_steer:
+        result["pending_steer"] = leftover_steer
+    agent._response_was_previewed = False
+    if interrupted and agent._interrupt_message:
+        result["interrupt_message"] = agent._interrupt_message
+    agent.clear_interrupt()
+    agent._stream_callback = None
+    review_skills = _review_skills_due(agent)
+    agent._sync_external_memory_for_turn(
+        original_user_message=original_user_message, final_response=final_response,
+        interrupted=interrupted, messages=messages,
+    )
+    _maybe_review_after_delivery(agent, final_response, interrupted, messages, review_memory, review_skills)
+    # CLI/gateway, not the per-message finalizer, own memory-provider shutdown.
+    if not getattr(agent, "_persist_disabled", False):
+        _invoke_hook_safely(
+            "on_session_end", logger,
+            session_id=agent.session_id, task_id=effective_task_id, turn_id=turn_id,
+            completed=completed, failed=failed, interrupted=interrupted,
+            turn_exit_reason=turn_exit_reason, model=agent.model, platform=platform,
+        )
+    agent._turn_preflight_display_snapshot = None
+    agent._turn_received_provider_response = False
+
+
+def _finish_response(
+    agent, final_response, *, interrupted, turn_exit_reason, preserved_verification_fallback,
+    logger, platform, effective_task_id, turn_id, original_user_message, messages,
+    api_call_count, failed,
+):
+    # Response transforms apply only to real, uninterrupted responses.
+    if final_response and not interrupted:
+        final_response = _append_file_mutation_footer(agent, final_response, logger)
+    if not interrupted:
+        final_response = _explain_abnormal_exit(
+            agent, final_response, turn_exit_reason, preserved_verification_fallback, logger,
+        )
+    response_transformed = False
+    pre_transform_response = None
+    if final_response and not interrupted:
+        final_response, response_transformed, pre_transform_response = _apply_output_hooks(
+            agent, final_response, logger, platform=platform, effective_task_id=effective_task_id,
+            turn_id=turn_id, original_user_message=original_user_message, messages=messages,
+        )
+    # Context-engine observation is fail-open, after output hooks and before sanitization.
+    try:
+        from agent.conversation_loop import _notify_context_engine_turn_complete
+        _notify_context_engine_turn_complete(
+            agent, messages, usage=getattr(agent, "_last_turn_usage", None), logger=logger,
+            turn_id=turn_id, task_id=effective_task_id, api_call_count=api_call_count,
+            interrupted=interrupted, failed=failed, turn_exit_reason=turn_exit_reason,
+        )
+    except Exception as exc:
+        logger.warning("on_turn_complete notification failed: %s", exc)
+    # RAW SDK content can contain lone UTF-16 surrogates that break downstream delivery.
+    if isinstance(final_response, str):
+        final_response = _sanitize_surrogates(final_response)
+    return final_response, response_transformed, pre_transform_response
+
+
 def finalize_turn(
     agent, *, final_response, api_call_count, interrupted, failed, messages, conversation_history,
     effective_task_id, turn_id, user_message, original_user_message, _should_review_memory,
@@ -494,164 +579,27 @@ def finalize_turn(
 
     _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_reason, interrupted, logger)
 
-    # Response transforms apply only to real, uninterrupted responses.
-    if final_response and not interrupted:
-        final_response = _append_file_mutation_footer(agent, final_response, logger)
-    if not interrupted:
-        final_response = _explain_abnormal_exit(
-            agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger,
-        )
-
     _platform = getattr(agent, "platform", None) or ""
-    _response_transformed = False
-    _pre_transform_response = None
-    if final_response and not interrupted:
-        final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
-            agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
-            turn_id=turn_id, original_user_message=original_user_message, messages=messages,
-        )
-
-    # Context engine observation hook: the turn finished with the finalized transcript.
-    # Fail-open. ``_last_turn_usage`` is the last response's canonical usage dict, or
-    # ``None`` on turns that never reached a provider response — by contract.
-    try:
-        from agent.conversation_loop import _notify_context_engine_turn_complete
-        _notify_context_engine_turn_complete(
-            agent, messages, usage=getattr(agent, "_last_turn_usage", None), logger=logger,
-            turn_id=turn_id, task_id=effective_task_id, api_call_count=api_call_count,
-            interrupted=interrupted, failed=failed, turn_exit_reason=_turn_exit_reason,
-        )
-    except Exception as exc:
-        logger.warning("on_turn_complete notification failed: %s", exc)
-
-    # Surrogate chokepoint: RAW SDK text with a lone UTF-16 surrogate crashes downstream
-    # consumers (stdout, Telegram ``utf16_len``, JSON); scrub once where it leaves the loop.
-    # Class-level surrogate chokepoint (#80366, #55143, #55309, #19819): ``final_response`` is often the RAW
-    # SDK content (``assistant_message.content``), not the sanitized copy stored in history by
-    # ``build_assistant_message``. Any lone UTF-16 surrogate (U+D800–U+DFFF) in it crashes downstream
-    # consumers — oneshot stdout writes, Telegram's ``utf16_len`` length check, Signal formatting, JSON
-    # envelope encodes — on every provider (Ollama, NVIDIA NIM, …). Scrub once here, where model text leaves
-    # the conversation loop, so every delivery surface receives valid Unicode.
-    if isinstance(final_response, str):
-        final_response = _sanitize_surrogates(final_response)
-
-    result = {
-        "final_response": final_response,
-        "last_reasoning": _last_turn_reasoning(messages),
-        "messages": messages,
-        "api_calls": api_call_count,
-        "successful_provider_responses": min(
-            api_call_count, getattr(agent, "session_successful_provider_responses", 0)
-        ),
-        "provider_request_ids": list(getattr(agent, "session_provider_request_ids", [])),
-        "usage_telemetry_complete": (
-            getattr(agent, "session_usage_missing_responses", 0) == 0
-            and getattr(agent, "session_successful_provider_responses", 0) >= api_call_count
-        ),
-        "completed": completed,
-        "turn_exit_reason": _turn_exit_reason,
-        "failed": failed,
-        "partial": False,  # True only when stopped due to invalid tool calls
-        "interrupted": interrupted,
-        "response_transformed": _response_transformed,
-        "pre_transform_response": _pre_transform_response,
-        "response_previewed": getattr(agent, "_response_was_previewed", False),
-        "model": agent.model,
-        "provider": agent.provider,
-        "base_url": agent.base_url,
-        **{key: getattr(agent, f"session_{key}") for key in _SESSION_TOKEN_KEYS},
-        # Gateway SessionEntry persists an API reading, never the preflight display seed.
-        "last_prompt_tokens": (
-            getattr(agent.context_compressor, "last_real_prompt_tokens", agent.context_compressor.last_prompt_tokens)
-            if getattr(agent.context_compressor, "last_prompt_tokens", 0) > 0
-            else getattr(agent.context_compressor, "last_prompt_tokens", 0)
-        ) or 0,
-        **{key: getattr(agent, f"session_{key}") for key in _SESSION_COST_KEYS},
-        **({"cost_status": "estimated", "cost_source": "mixed_estimated_responses"}
-           if getattr(agent, "session_cost_estimated_responses", 0) else {}),
-        # A sum of priced calls is not the total when any call had unknown cost.
-        # Keep per-call usage for audits, but never expose the partial sum as a run total.
-        **({"estimated_cost_usd": None, "cost_status": "unknown", "cost_source": "incomplete_responses"}
-           if getattr(agent, "session_cost_missing_responses", 0) else {}),
-        # Requested service tier, for billing audits (`hermes -z --usage-file`).
-        "service_tier": (
-            (getattr(agent, "request_overrides", {}) or {}).get("extra_body") or {}
-        ).get("service_tier"),
-        "session_id": agent.session_id,
-    }
-    if agent._tool_guardrail_halt_decision is not None:
-        result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
-    # Persistence failures already set failed=True; also stamp `error` so the gateway
-    # surfaces status="error" (desktop can toast) instead of a quiet complete frame, plus
-    # the machine-readable cause 'session_persistence_failed:<locked|compression|...>'.
-    if failed and str(_turn_exit_reason) == "session_persistence_failed":
-        result["error"] = final_response or (
-            "session storage could not be written — check the state database "
-            "health (`hermes doctor`), then send your message again"
-        )
-        _cause = getattr(agent, "_last_persistence_error_cause", None)
-        result["failure_reason"] = "session_persistence_failed:" + (_cause or "unknown")
-    # Cleanup failures are surfaced, but the response is returned either way (#8049).
-    if _cleanup_errors:
-        result["cleanup_errors"] = _cleanup_errors
-    # A /steer landing after the final assistant turn has no tool batch to drain into;
-    # hand it back so it becomes the next user turn instead of being lost.
-    _leftover_steer = agent._drain_pending_steer()
-    if _leftover_steer:
-        result["pending_steer"] = _leftover_steer
-    agent._response_was_previewed = False
-    if interrupted and agent._interrupt_message:
-        result["interrupt_message"] = agent._interrupt_message
-    agent.clear_interrupt()
-    agent._stream_callback = None  # don't leak into future calls
-
-    # Skill trigger is checked NOW — based on how many tool iterations THIS turn used.
-    _should_review_skills = (
-        agent._skill_nudge_interval > 0
-        and agent._iters_since_skill >= agent._skill_nudge_interval
-        and "skill_manage" in agent.valid_tool_names
-    )
-    if _should_review_skills:
-        agent._iters_since_skill = 0
-
-    # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message, final_response=final_response,
-        interrupted=interrupted, messages=messages,
+    final_response, _response_transformed, _pre_transform_response = _finish_response(
+        agent, final_response, interrupted=interrupted, turn_exit_reason=_turn_exit_reason,
+        preserved_verification_fallback=preserved_verification_fallback, logger=logger,
+        platform=_platform, effective_task_id=effective_task_id, turn_id=turn_id,
+        original_user_message=original_user_message, messages=messages,
+        api_call_count=api_call_count, failed=failed,
     )
 
-    # Background memory/skill review runs AFTER delivery so it never competes with the
-    # user's task. Suppressed by skip_background_review (e.g. cron): the fork costs
-    # ~30K tokens / event with no human-in-the-loop benefit. Best-effort; the review
-    # clones the snapshot structurally so its sanitizers can't reach the live transcript.
-    if (
-        final_response
-        and not interrupted
-        and not getattr(agent, "skip_background_review", False)
-        and (_should_review_memory or _should_review_skills)
-    ):
-        with suppress(Exception):
-            agent._spawn_background_review(
-                messages_snapshot=list(messages), review_memory=_should_review_memory,
-                review_skills=_should_review_skills,
-            )
-
-    # Memory provider on_session_end()/shutdown_all() are NOT called here:
-    # run_conversation() runs once per message; CLI/gateway own session-end cleanup.
-    if not getattr(agent, "_persist_disabled", False):
-        _invoke_hook_safely(
-            "on_session_end", logger,
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            completed=completed,
-            failed=failed,
-            interrupted=interrupted,
-            turn_exit_reason=_turn_exit_reason,
-            model=agent.model,
-            platform=_platform,
-        )
-
-    agent._turn_preflight_display_snapshot = None
-    agent._turn_received_provider_response = False
+    result = build_turn_result(
+        agent, final_response=final_response, last_reasoning=_last_turn_reasoning(messages),
+        messages=messages, api_call_count=api_call_count, completed=completed,
+        turn_exit_reason=_turn_exit_reason, failed=failed, interrupted=interrupted,
+        response_transformed=_response_transformed, pre_transform_response=_pre_transform_response,
+        cleanup_errors=_cleanup_errors,
+    )
+    _complete_turn_delivery(
+        agent, result, final_response=final_response,
+        original_user_message=original_user_message, interrupted=interrupted,
+        messages=messages, review_memory=_should_review_memory, logger=logger,
+        effective_task_id=effective_task_id, turn_id=turn_id, completed=completed,
+        failed=failed, turn_exit_reason=_turn_exit_reason, platform=_platform,
+    )
     return result
