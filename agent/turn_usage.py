@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from agent.image_token_cost import calibrate_from_usage
+from agent.turn_usage_display import display_usage, log_response_usage
 from agent.usage_anchor import capture_usage_anchor, set_usage_anchor
 from agent.usage_pricing import estimate_usage_cost, normalize_usage, provider_reported_usage_cost
 
@@ -136,103 +137,52 @@ def _queue_response_usage(agent, canonical_usage, total_tokens, cost_delta, cost
                          agent.session_id, total_tokens, e)
 
 
-def record_response_usage(
-    agent: Any, response: Any, *, messages: List[Dict[str, Any]], api_call_count: int,
-    api_duration: float, compression_attempts: int, max_compression_attempts: int,
-) -> ResponseUsageOutcome:
-    """Fold ``response.usage`` into compressor, anchors, session counters, state.db
-    and the API-call log line (see module docstring). No-usage responses only
-    consume a pending compaction verdict. Returns the loop-visible outcome."""
-    rearmed = False
-    compressor = agent.context_compressor
-    # Count every completed provider attempt, including providers that omit usage.
-    # Token/cost accounting below stays gated on real usage, but the request itself
-    # must remain observable.
-    agent.session_api_calls += 1
-    agent.session_successful_provider_responses += 1
-    response_id = getattr(response, "id", None)
-    if (isinstance(response_id, str) and not response_id.startswith("stream-")
-            and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", response_id)):
-        agent.session_provider_request_ids.append(response_id)
-    if not (hasattr(response, 'usage') and response.usage):
-        agent.session_usage_missing_responses += 1
-        agent.session_cost_missing_responses += 1
-        if getattr(compressor, "awaiting_real_usage_after_compression", False):
-            # No usage -> cannot adjudicate the prior compaction; consume the
-            # pending verdict so later readings aren't charged to it and
-            # preflight deferral isn't latched indefinitely.
-            compressor.update_from_response({})
-        _note_usage_less = getattr(compressor, "note_usage_less_response", None)
-        if callable(_note_usage_less):
-            _note_usage_less()
-        logger.info(
-            "API call #%d: model=%s provider=%s in=? out=? total=? latency=%.1fs usage=unavailable",
-            agent.session_api_calls, agent.model, agent.provider or "unknown", api_duration,
-        )
-        return ResponseUsageOutcome(compression_attempts=compression_attempts, rearmed=rearmed)
+def _record_missing_usage(agent, compressor, api_duration):
+    agent.session_usage_missing_responses += 1
+    agent.session_cost_missing_responses += 1
+    if getattr(compressor, "awaiting_real_usage_after_compression", False):
+        compressor.update_from_response({})
+    note_usage_less = getattr(compressor, "note_usage_less_response", None)
+    if callable(note_usage_less):
+        note_usage_less()
+    logger.info(
+        "API call #%d: model=%s provider=%s in=? out=? total=? latency=%.1fs usage=unavailable",
+        agent.session_api_calls, agent.model, agent.provider or "unknown", api_duration,
+    )
 
-    canonical_usage = normalize_usage(response.usage, provider=agent.provider, api_mode=agent.api_mode)
-    # Aggregator-only usage kept for pricing: advisor tokens are priced at each advisor's
-    # OWN model rate and added as dollars below.
-    aggregator_usage = canonical_usage
-    _moa_client, canonical_usage, _moa_ref_cost = _fold_moa_usage(agent, canonical_usage)
+
+def _update_compressor_usage(
+    agent, compressor, messages, aggregator_usage, canonical_usage,
+    usage_dict, api_call_count, compression_attempts, max_compression_attempts,
+):
     prompt_tokens = canonical_usage.prompt_tokens
-    completion_tokens = canonical_usage.output_tokens
-    total_tokens = canonical_usage.total_tokens
-    # Canonical token + cache buckets for context engines; legacy keys stay for back-compat.
-    usage_dict = {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": total_tokens,
-        "input_tokens": canonical_usage.input_tokens,
-        "output_tokens": canonical_usage.output_tokens,
-        "cache_read_tokens": canonical_usage.cache_read_tokens,
-        "cache_write_tokens": canonical_usage.cache_write_tokens,
-        "reasoning_tokens": canonical_usage.reasoning_tokens,
-    }
-    # Capture the boundary latch before update_from_response() consumes it: only the real
-    # prompt count right after a compaction rearms the budget.
-    _completed_compaction_pending = bool(
+    completed_compaction_pending = bool(
         getattr(compressor, "_verify_compaction_cleared_threshold", False)
     )
     compressor.update_from_response(usage_dict)
-    # Usage-anchored accounting: snapshot exact provider usage against the durable
-    # transcript (main-loop ONLY; MoA uses pre-fold aggregator usage). The display meter
-    # anchors on the turn's FIRST response: later same-turn responses inflate
-    # prompt_tokens with replayed thinking. Display-only; compression math uses real usage.
-    # The provider just priced this request exactly: if the delta since the previous anchor
-    # introduced images, the residual is their real per-image cost (learned before re-anchoring).
     calibrate_from_usage(agent, messages, aggregator_usage.prompt_tokens)
-    _new_anchor = capture_usage_anchor(
+    new_anchor = capture_usage_anchor(
         aggregator_usage.prompt_tokens, aggregator_usage.output_tokens, messages
     )
-    if _new_anchor is not None:
-        set_usage_anchor(agent, _new_anchor, turn_base=api_call_count == 1)
-    _compression_threshold = int(getattr(compressor, "threshold_tokens", 0) or 0)
-    if _loop_mod()._should_rearm_compression_budget(
-        compression_attempts, completed_compaction_pending=_completed_compaction_pending,
-        prompt_tokens=prompt_tokens, threshold_tokens=_compression_threshold,
-    ):
+    if new_anchor is not None:
+        set_usage_anchor(agent, new_anchor, turn_base=api_call_count == 1)
+    compression_threshold = int(getattr(compressor, "threshold_tokens", 0) or 0)
+    rearmed = _loop_mod()._should_rearm_compression_budget(
+        compression_attempts, completed_compaction_pending=completed_compaction_pending,
+        prompt_tokens=prompt_tokens, threshold_tokens=compression_threshold,
+    )
+    if rearmed:
         logger.info(
             "Compression budget rearmed after provider-confirmed "
             "recovery: prompt=%s < threshold=%s (attempts were %s/%s)",
-            f"{prompt_tokens:,}",
-            f"{_compression_threshold:,}",
-            compression_attempts,
-            max_compression_attempts,
+            f"{prompt_tokens:,}", f"{compression_threshold:,}",
+            compression_attempts, max_compression_attempts,
         )
         compression_attempts = 0
-        # Confirmed recovery also clears the loop's stale insufficient-progress verdict
-        # (``_preflight_compression_blocked``), else a later pressure spike grows unchecked.
-        rearmed = True
+    return compression_attempts, rearmed
 
-    # Stash canonical usage for on_turn_complete(); keep the latest call's.
-    agent._last_turn_usage = dict(usage_dict)
-    # The parent's CURRENT prompt size for headroom math (delegate summary budgets): the
-    # aggregator's own prompt, never the MoA-folded total (advisor prompts are not in this context).
-    agent._last_prompt_size_tokens = int(aggregator_usage.prompt_tokens or 0)
 
-    # Persist only provider-confirmed context lengths, not probe tiers.
+def _persist_confirmed_context(agent, compressor):
     if getattr(compressor, "_context_probed", False):
         ctx = compressor.context_length
         if getattr(compressor, "_context_probe_persistable", False):
@@ -243,9 +193,11 @@ def record_response_usage(
         compressor._context_probed = False
         compressor._context_probe_persistable = False
 
-    agent.session_prompt_tokens += prompt_tokens
-    agent.session_completion_tokens += completion_tokens
-    agent.session_total_tokens += total_tokens
+
+def _accumulate_session_usage(agent, canonical_usage, api_duration):
+    agent.session_prompt_tokens += canonical_usage.prompt_tokens
+    agent.session_completion_tokens += canonical_usage.output_tokens
+    agent.session_total_tokens += canonical_usage.total_tokens
     agent.session_input_tokens += canonical_usage.input_tokens
     agent.session_output_tokens += canonical_usage.output_tokens
     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
@@ -260,31 +212,60 @@ def record_response_usage(
         if ohist is not None:
             ohist.append(int(canonical_usage.output_tokens or 0))
 
-    _cache_pct = ""
-    if canonical_usage.cache_read_tokens and prompt_tokens:
-        _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
-    # write= is the money (cache writes cost 50x a read); id= is what a provider needs to look the
-    # request up; upstream= is who actually served it when the route reports that (OpenRouter's
-    # `provider`). Diagnosing the 1,393-agent run's cache misses took a DB join and a live probe
-    # because none of the three were on this line.
-    if canonical_usage.cache_write_tokens:
-        _cache_pct += f" write={canonical_usage.cache_write_tokens}"
-    _rid = getattr(response, "id", None)
-    _ident = f" id={_rid}" if isinstance(_rid, str) and _rid else ""
-    _upstream = getattr(response, "provider", None)
-    if isinstance(_upstream, str) and _upstream:
-        _ident += f" upstream={_upstream}"
-    logger.info(
-        "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s%s",
-        agent.session_api_calls, agent.model, agent.provider or "unknown",
-        prompt_tokens, completion_tokens, total_tokens,
-        api_duration, _cache_pct, _ident,
+
+def record_response_usage(
+    agent: Any, response: Any, *, messages: List[Dict[str, Any]], api_call_count: int,
+    api_duration: float, compression_attempts: int, max_compression_attempts: int,
+) -> ResponseUsageOutcome:
+    """Fold ``response.usage`` into compressor, anchors, session counters, state.db
+    and the API-call log line (see module docstring). No-usage responses only
+    consume a pending compaction verdict. Returns the loop-visible outcome."""
+    compressor = agent.context_compressor
+    # Count every completed provider attempt, including providers that omit usage.
+    # Token/cost accounting below stays gated on real usage, but the request itself
+    # must remain observable.
+    agent.session_api_calls += 1
+    agent.session_successful_provider_responses += 1
+    response_id = getattr(response, "id", None)
+    if (isinstance(response_id, str) and not response_id.startswith("stream-")
+            and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", response_id)):
+        agent.session_provider_request_ids.append(response_id)
+    if not (hasattr(response, 'usage') and response.usage):
+        _record_missing_usage(agent, compressor, api_duration)
+        return ResponseUsageOutcome(compression_attempts=compression_attempts)
+
+    canonical_usage = normalize_usage(response.usage, provider=agent.provider, api_mode=agent.api_mode)
+    # Aggregator-only usage kept for pricing: advisor tokens are priced at each advisor's
+    # OWN model rate and added as dollars below.
+    aggregator_usage = canonical_usage
+    _moa_client, canonical_usage, _moa_ref_cost = _fold_moa_usage(agent, canonical_usage)
+    prompt_tokens = canonical_usage.prompt_tokens
+    total_tokens = canonical_usage.total_tokens
+    # Canonical token + cache buckets for context engines; legacy keys stay for back-compat.
+    usage_dict = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": canonical_usage.output_tokens,
+        "total_tokens": total_tokens,
+        "input_tokens": canonical_usage.input_tokens,
+        "output_tokens": canonical_usage.output_tokens,
+        "cache_read_tokens": canonical_usage.cache_read_tokens,
+        "cache_write_tokens": canonical_usage.cache_write_tokens,
+        "reasoning_tokens": canonical_usage.reasoning_tokens,
+    }
+    compression_attempts, rearmed = _update_compressor_usage(
+        agent, compressor, messages, aggregator_usage, canonical_usage,
+        usage_dict, api_call_count, compression_attempts, max_compression_attempts,
     )
-    # nous.anthropic_wire=auto: the session's wire is decided once, from this first response.
-    if agent.session_api_calls == 1 and (agent.provider or "") == "nous":
-        with suppress(Exception):
-            from agent.nous_wire import maybe_switch_wire_after_first_response
-            maybe_switch_wire_after_first_response(agent, response, agent.session_api_calls)
+
+    # Stash canonical usage for on_turn_complete(); keep the latest call's.
+    agent._last_turn_usage = dict(usage_dict)
+    # The parent's CURRENT prompt size for headroom math (delegate summary budgets): the
+    # aggregator's own prompt, never the MoA-folded total (advisor prompts are not in this context).
+    agent._last_prompt_size_tokens = int(aggregator_usage.prompt_tokens or 0)
+
+    _persist_confirmed_context(agent, compressor)
+    _accumulate_session_usage(agent, canonical_usage, api_duration)
+    log_response_usage(agent, response, canonical_usage, api_duration)
 
     # Price only the aggregator response; MoA advisors retain their own cost provenance.
     cost_delta, cost_status, cost_source = _record_response_cost(
@@ -292,19 +273,5 @@ def record_response_usage(
     )
     _queue_response_usage(agent, canonical_usage, total_tokens, cost_delta, cost_status, cost_source)
 
-    if agent.verbose_logging:
-        logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
-
-    # Report cache stats for any provider that returns ``prompt_tokens_details.cached_tokens``,
-    # not only when we inject cache_control markers.
-    cached = canonical_usage.cache_read_tokens
-    written = canonical_usage.cache_write_tokens
-    prompt = usage_dict["prompt_tokens"]
-    if (cached or written) and not agent.quiet_mode:
-        hit_pct = (cached / prompt * 100) if prompt > 0 else 0
-        agent._vprint(
-            f"{agent.log_prefix}   💾 Cache: "
-            f"{cached:,}/{prompt:,} tokens "
-            f"({hit_pct:.0f}% hit, {written:,} written)"
-        )
+    display_usage(agent, usage_dict, canonical_usage)
     return ResponseUsageOutcome(compression_attempts=compression_attempts, rearmed=rearmed)
