@@ -13,6 +13,7 @@ from contextlib import suppress
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
+from agent.effective_request_capture import capture_final_provider_request
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from agent.usage_anchor import set_usage_anchor
 
@@ -947,7 +948,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
         stream_kwargs["stream"] = True
-        return active_client.responses.create(**_bypass_sdk_request_transform(stream_kwargs))
+        sdk_kwargs = _bypass_sdk_request_transform(stream_kwargs)
+        capture_final_provider_request(agent, sdk_kwargs, transport="codex_responses")
+        return active_client.responses.create(**sdk_kwargs)
 
     def _log_failure(exc: BaseException) -> None:
         request_body_bytes, exception_chain = _codex_request_failure_details(exc)
