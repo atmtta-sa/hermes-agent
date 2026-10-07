@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.execution_checkpoint import build_execution_checkpoint
 from agent.fast_mode import begin_turn as begin_fast_mode_turn
 from agent.message_metadata import append_message
 from agent.message_sanitization import _repair_tool_call_arguments, _sanitize_surrogates
@@ -1432,6 +1433,12 @@ def _annotate_request_budget_stop(agent: Any, result: Dict[str, Any]) -> None:
         )
         if reason == "session_rollover_required":
             result["failed"] = True
+            checkpoint = build_execution_checkpoint(
+                cwd=resolve_agent_cwd(),
+                session_id=getattr(agent, "session_id", None),
+            )
+            if checkpoint is not None:
+                result["execution_checkpoint"] = checkpoint
 
 
 def _run_conversation_turn(
