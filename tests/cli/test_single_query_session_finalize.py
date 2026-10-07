@@ -245,6 +245,39 @@ def test_quiet_single_query_writes_typed_rollover_result(monkeypatch, tmp_path):
     }
 
 
+def test_quiet_single_query_persists_execution_checkpoint(monkeypatch, tmp_path):
+    import cli as cli_mod
+
+    target = tmp_path / "run-result.json"
+    checkpoint = {
+        "version": 1,
+        "workspace": {
+            "cwd": "/workspace",
+            "gitHead": "a" * 40,
+            "branch": "fix/rollover",
+            "statusSha256": "b" * 64,
+        },
+        "patch": {"kind": "git_diff", "sha256": "c" * 64, "bytes": 12},
+        "tests": {"status": "not_run", "commands": []},
+        "blockers": {"status": "clear", "evidence": ["managed rollover"]},
+        "nextAction": "Continue the current issue from the durable workspace.",
+    }
+    monkeypatch.setenv("HERMES_RUN_RESULT_FILE", str(target))
+
+    cli_mod._write_quiet_result_file(
+        {
+            "failed": True,
+            "partial": True,
+            "stop_reason": "session_rollover_required",
+            "turn_exit_reason": "session_rollover_required",
+            "execution_checkpoint": checkpoint,
+        },
+        "session-before-rollover",
+    )
+
+    assert json.loads(target.read_text())["execution_checkpoint"] == checkpoint
+
+
 def test_quiet_result_keeps_usage_and_provider_evidence_without_response_text(monkeypatch, tmp_path):
     import cli as cli_mod
 

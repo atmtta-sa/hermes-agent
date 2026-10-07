@@ -4088,12 +4088,17 @@ def _quiet_usage_fields(record: dict) -> dict:
     }
 
 
+def _quiet_execution_checkpoint(record: dict) -> dict:
+    checkpoint = record.get("execution_checkpoint")
+    return {} if checkpoint is None else {"execution_checkpoint": checkpoint}
+
+
 def _write_quiet_result_file(result: object, session_id: str) -> None:
     """Best-effort machine metadata for an explicitly configured automation caller."""
     target = os.environ.get("HERMES_RUN_RESULT_FILE", "").strip()
     if not target:
         return
-    record = result if isinstance(result, dict) else {}
+    record: Dict[str, Any] = result if isinstance(result, dict) else {}
     priced_cost = record.get("cost_status") in {"estimated", "actual", "included"}
     cost = record.get("estimated_cost_usd") if priced_cost else None
     payload = {
@@ -4114,6 +4119,7 @@ def _write_quiet_result_file(result: object, session_id: str) -> None:
         "cost_unavailable_reason": None if cost is not None else "cost_not_reported",
         "cost_status": record.get("cost_status"),
         "cost_source": record.get("cost_source"),
+        **_quiet_execution_checkpoint(record),
     }
     path = Path(target).expanduser()
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")

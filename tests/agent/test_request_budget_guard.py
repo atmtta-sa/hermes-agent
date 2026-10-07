@@ -3,6 +3,7 @@
 import json
 import time
 
+import agent.conversation_loop as conversation_loop
 from agent.agent_init import _load_autonomous_budget_envelope
 from agent.conversation_loop import _annotate_request_budget_stop
 from agent.turn_iteration_prep import prepare_iteration
@@ -76,6 +77,35 @@ def test_rollover_result_exits_as_failure_for_paperclip_retry():
 
     assert result["failed"] is True
     assert result["turn_exit_reason"] == "session_rollover_required"
+
+
+def test_rollover_result_includes_durable_execution_checkpoint(monkeypatch):
+    checkpoint = {
+        "version": 1,
+        "workspace": {
+            "cwd": "/workspace",
+            "gitHead": "a" * 40,
+            "branch": "fix/rollover",
+            "statusSha256": "b" * 64,
+        },
+        "patch": {"kind": "git_diff", "sha256": "c" * 64, "bytes": 12},
+        "tests": {"status": "not_run", "commands": []},
+        "blockers": {"status": "clear", "evidence": ["managed rollover"]},
+        "nextAction": "Continue the current issue from the durable workspace.",
+    }
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_execution_checkpoint",
+        lambda **_kwargs: checkpoint,
+        raising=False,
+    )
+    agent = _BudgetAgent()
+    agent._request_budget_stop_reason = "session_rollover_required"
+    result = {"failed": False, "final_response": "Unfinished work"}
+
+    _annotate_request_budget_stop(agent, result)
+
+    assert result["execution_checkpoint"] == checkpoint
 
 
 def test_stops_before_request_when_cumulative_input_budget_is_exhausted():
