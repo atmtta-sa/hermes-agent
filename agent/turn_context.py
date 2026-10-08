@@ -476,7 +476,12 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
     agent.iteration_budget = IterationBudget(agent.max_iterations)
     # Wall-clock run budget: stamped only when configured (one wrap-up notice per run).
     agent._run_budget_started_at = (
-        time.time() if getattr(agent, "run_budget_seconds", None) else None
+        time.time()
+        if (
+            getattr(agent, "run_budget_seconds", None)
+            or getattr(agent, "max_run_seconds", None)
+        )
+        else None
     )
     # Reset the streaming context / think scrubbers at the top of each turn.
     for name in ("_stream_context_scrubber", "_stream_think_scrubber"):

@@ -9,6 +9,7 @@ Symbols that tests patch on ``run_agent.*`` (``OpenAI``, ``get_tool_definitions`
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -20,7 +21,7 @@ from collections import deque
 from contextlib import suppress
 from datetime import datetime
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, cast
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
@@ -315,6 +316,46 @@ def _normalize_run_budget_seconds(value) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return seconds if seconds > 0 else None  # NaN compares False → None
+
+
+def _load_autonomous_budget_envelope(
+    environ: Mapping[str, str],
+) -> tuple[bool, Dict[str, int | float]]:
+    """Load Paperclip's complete reserved envelope; partial data is never applied."""
+    if not environ.get("PAPERCLIP_RUN_ID"):
+        return False, {}
+    try:
+        payload = json.loads(environ.get("HERMES_AUTONOMOUS_BUDGET_JSON", ""))
+    except (TypeError, ValueError):
+        return True, {}
+    if not isinstance(payload, dict):
+        return True, {}
+
+    names = (
+        "requestCount",
+        "inputTokens",
+        "outputTokens",
+        "runtimeMs",
+        "costMicrousd",
+    )
+    if set(payload) != set(names):
+        return True, {}
+    values = {name: payload.get(name) for name in names}
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value <= 0
+        for value in values.values()
+    ):
+        return True, {}
+    validated = cast(Dict[str, int], values)
+
+    return True, {
+        "max_request_input_tokens": min(64_000, validated["inputTokens"]),
+        "max_cumulative_input_tokens": validated["inputTokens"],
+        "max_cumulative_output_tokens": validated["outputTokens"],
+        "max_model_requests_per_run": validated["requestCount"],
+        "max_run_seconds": validated["runtimeMs"] / 1_000,
+        "max_estimated_cost_usd": validated["costMicrousd"] / 1_000_000,
+    }
 
 
 
@@ -662,6 +703,17 @@ def _init_turn_state(agent, run_budget_seconds):
     # Wall-clock run budget per turn: constructor arg wins, else agent.run_budget_seconds
     # (in _apply_agent_section). None = fully off (no clock reads, injection, or capping).
     agent.run_budget_seconds = _normalize_run_budget_seconds(run_budget_seconds)
+    required, limits = _load_autonomous_budget_envelope(os.environ)
+    agent.autonomous_budget_required = required
+    for name in (
+        "max_request_input_tokens",
+        "max_cumulative_input_tokens",
+        "max_cumulative_output_tokens",
+        "max_model_requests_per_run",
+        "max_run_seconds",
+        "max_estimated_cost_usd",
+    ):
+        setattr(agent, name, limits.get(name))
     from agent.credits_tracker import new_credits_latch
     agent._credits_latch = new_credits_latch()  # threshold-notice latch (sticky keys + gates)
 
@@ -2131,6 +2183,11 @@ _USAGE_STATE: Dict[str, Any] = {
     "session_completion_tokens": 0,
     "session_total_tokens": 0,
     "session_api_calls": 0,
+    "session_successful_provider_responses": 0,
+    "session_usage_missing_responses": 0,
+    "session_cost_missing_responses": 0,
+    "session_cost_estimated_responses": 0,
+    "session_provider_request_ids": list,
     "session_input_tokens": 0,
     "session_output_tokens": 0,
     "session_cache_read_tokens": 0,

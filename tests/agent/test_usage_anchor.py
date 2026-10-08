@@ -305,6 +305,15 @@ class TestCodexAppServerAnchor:
 
         assert agent._usage_anchor is prior
 
+    def test_codex_response_evidence_distinguishes_missing_tokens(self):
+        from agent.codex_runtime import _record_codex_app_server_usage
+
+        agent = self._agent()
+        _record_codex_app_server_usage(agent, self._turn(None))
+        _record_codex_app_server_usage(agent, self._turn(self._usage()))
+        assert agent.session_successful_provider_responses == 2
+        assert agent.session_usage_missing_responses == 1
+
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
