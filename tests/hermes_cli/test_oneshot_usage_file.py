@@ -40,6 +40,20 @@ class TestWriteUsageFile:
         assert report["failed"] is False
         assert "failure" not in report
 
+    def test_writes_typed_rollover_reason(self, tmp_path):
+        path = tmp_path / "usage.json"
+        _write_usage_file(
+            str(path),
+            _result(
+                stop_reason="session_rollover_required",
+                turn_exit_reason="session_rollover_required",
+            ),
+        )
+
+        report = json.loads(path.read_text())
+        assert report["stop_reason"] == "session_rollover_required"
+        assert report["turn_exit_reason"] == "session_rollover_required"
+
     def test_none_path_is_noop(self, tmp_path):
         # Must not raise and must not create a report file.
         _write_usage_file(None, _result())

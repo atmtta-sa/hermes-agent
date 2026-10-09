@@ -14,6 +14,7 @@ import shutil
 import sys
 import json
 import re
+import uuid
 import atexit
 import errno
 import time
@@ -4077,6 +4078,86 @@ def _sync_cli_session_id_from_agent(cli) -> None:
         cli.session_id = cli.agent.session_id
 
 
+def _quiet_endpoint_class(record: dict) -> str:
+    """Classify a known route without persisting host, path, query, or credentials."""
+    if record.get("provider") == "openai-codex" and not record.get("base_url"):
+        return "codex_app_server"
+    try:
+        parsed = urlparse(record.get("base_url") or "")
+        if parsed.scheme == "https" and parsed.hostname == "openrouter.ai":
+            return "openrouter_api"
+        if parsed.scheme == "https" and parsed.hostname == "api.openai.com":
+            return "openai_api"
+    except (TypeError, ValueError):
+        pass
+    return "unknown"
+
+
+def _quiet_usage_fields(record: dict) -> dict:
+    """Keep response evidence separate from token completeness."""
+    calls = record.get("api_calls") or 0
+    responses = record.get("successful_provider_responses") or 0
+    return {
+        "api_calls": calls,
+        "successful_provider_responses": responses,
+        "usage_telemetry_complete": bool(
+            record.get("usage_telemetry_complete")
+            and responses == calls
+            and (calls == 0 or (record.get("input_tokens") is not None and
+                                record.get("output_tokens") is not None))
+        ),
+        "input_tokens": record.get("input_tokens"),
+        "output_tokens": record.get("output_tokens"),
+        "cache_read_tokens": record.get("cache_read_tokens"),
+        "cache_write_tokens": record.get("cache_write_tokens"),
+    }
+
+
+def _quiet_execution_checkpoint(record: dict) -> dict:
+    checkpoint = record.get("execution_checkpoint")
+    return {} if checkpoint is None else {"execution_checkpoint": checkpoint}
+
+
+def _write_quiet_result_file(result: object, session_id: str) -> None:
+    """Best-effort machine metadata for an explicitly configured automation caller."""
+    target = os.environ.get("HERMES_RUN_RESULT_FILE", "").strip()
+    if not target:
+        return
+    record: Dict[str, Any] = result if isinstance(result, dict) else {}
+    priced_cost = record.get("cost_status") in {"estimated", "actual", "included"}
+    cost = record.get("estimated_cost_usd") if priced_cost else None
+    payload = {
+        "version": 2,
+        "session_id": session_id,
+        "stop_reason": record.get("stop_reason"),
+        "turn_exit_reason": record.get("turn_exit_reason"),
+        "failed": bool(record.get("failed")),
+        "partial": bool(record.get("partial")),
+        "provider": record.get("provider"),
+        "model": record.get("model"),
+        "endpoint_class": _quiet_endpoint_class(record),
+        "provider_request_ids": [request_id for request_id in (record.get("provider_request_ids") or [])
+                                 if isinstance(request_id, str) and
+                                 re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id)],
+        **_quiet_usage_fields(record),
+        "estimated_cost_usd": cost,
+        "cost_unavailable_reason": None if cost is not None else "cost_not_reported",
+        "cost_status": record.get("cost_status"),
+        "cost_source": record.get("cost_source"),
+        **_quiet_execution_checkpoint(record),
+    }
+    path = Path(target).expanduser()
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.replace(path)
+    except OSError as exc:
+        logger.warning("Could not write Hermes run result file %s: %s", path, exc)
+        with suppress(OSError):
+            temporary.unlink()
+
+
 def _run_quiet_single_query(cli, effective_query):
     """Quiet (-Q) one-shot turn: run, print the response (stderr for errors/session_id), then sys.exit with the automation exit code.
     HERMES_TURN_AUTHOR (set only by a bot-to-bot dispatcher) is consumed here so tool subprocesses do not inherit it.
@@ -4155,6 +4236,7 @@ def _run_quiet_single_query(cli, effective_query):
             logger.debug("kanban goal loop failed: %s", _goal_exc)
 
     print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+    _write_quiet_result_file(result, cli.session_id)
 
     # Exit code 0/1 for automation wrappers. Kanban workers that failed purely on
     # rate-limit/billing exit with the EX_TEMPFAIL sentinel so the dispatcher releases

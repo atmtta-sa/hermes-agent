@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.execution_checkpoint import build_execution_checkpoint
 from agent.fast_mode import begin_turn as begin_fast_mode_turn
 from agent.message_metadata import append_message
 from agent.message_sanitization import _repair_tool_call_arguments, _sanitize_surrogates
@@ -1420,6 +1421,26 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _annotate_request_budget_stop(agent: Any, result: Dict[str, Any]) -> None:
+    reason = getattr(agent, "_request_budget_stop_reason", None)
+    if reason:
+        result.update(
+            error=reason,
+            partial=True,
+            budget_exhausted=True,
+            stop_reason=reason,
+            turn_exit_reason=reason,
+        )
+        if reason == "session_rollover_required":
+            result["failed"] = True
+            checkpoint = build_execution_checkpoint(
+                cwd=resolve_agent_cwd(),
+                session_id=getattr(agent, "session_id", None),
+            )
+            if checkpoint is not None:
+                result["execution_checkpoint"] = checkpoint
+
+
 def _run_conversation_turn(
     agent,
     user_message: Any,
@@ -1496,6 +1517,7 @@ def _run_conversation_turn(
     agent._ephemeral_reasoning_off = False
     agent._auth_pool_refresh_counts = {}
     agent._last_turn_usage = None
+    agent._request_budget_stop_reason = None
 
     s = _LoopState(
         system_message=system_message, moa_config=moa_config,
@@ -1514,7 +1536,8 @@ def _run_conversation_turn(
     while (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         if _run_phase(begin_iteration, agent, s).action == "break":
             break
-        _run_phase(prepare_iteration, agent, s)
+        if _run_phase(prepare_iteration, agent, s).action == "stop":
+            break
         _run_phase(assemble_api_request, agent, s)
         _pg = _run_phase(run_preflight_gate, agent, s)
         if _pg.action == "return":
@@ -1563,6 +1586,7 @@ def _run_conversation_turn(
         name: getattr(s, name)
         for name in inspect.signature(finalize_turn).parameters if name != "agent"
     })
+    _annotate_request_budget_stop(agent, result)
     if s._compression_timeout_exhausted:
         # Reuse the gateway's context-recovery contract: transcript stays intact while
         # future input can move to a clean session (#98722).

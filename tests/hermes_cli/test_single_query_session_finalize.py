@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -201,3 +202,171 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     assert ("claim", "cli", True) in calls
     assert ("run", "hello", []) in calls
     assert calls[-1] == ("finalize", "quiet-session")
+
+
+def test_quiet_single_query_writes_typed_rollover_result(monkeypatch, tmp_path):
+    import cli as cli_mod
+
+    target = tmp_path / "run-result.json"
+    monkeypatch.setenv("HERMES_RUN_RESULT_FILE", str(target))
+    cli_mod._write_quiet_result_file(
+        {
+            "failed": True,
+            "partial": True,
+            "stop_reason": "session_rollover_required",
+            "turn_exit_reason": "session_rollover_required",
+            "final_response": "must not be persisted",
+        },
+        "session-before-rollover",
+    )
+
+    assert json.loads(target.read_text()) == {
+        "failed": True,
+        "partial": True,
+        "session_id": "session-before-rollover",
+        "stop_reason": "session_rollover_required",
+        "turn_exit_reason": "session_rollover_required",
+        "version": 2,
+        "provider": None,
+        "model": None,
+        "endpoint_class": "unknown",
+        "provider_request_ids": [],
+        "api_calls": 0,
+        "successful_provider_responses": 0,
+        "input_tokens": None,
+        "output_tokens": None,
+        "cache_read_tokens": None,
+        "cache_write_tokens": None,
+        "estimated_cost_usd": None,
+        "cost_status": None,
+        "cost_source": None,
+        "usage_telemetry_complete": False,
+        "cost_unavailable_reason": "cost_not_reported",
+    }
+
+
+def test_quiet_single_query_persists_execution_checkpoint(monkeypatch, tmp_path):
+    import cli as cli_mod
+
+    target = tmp_path / "run-result.json"
+    checkpoint = {
+        "version": 1,
+        "workspace": {
+            "cwd": "/workspace",
+            "gitHead": "a" * 40,
+            "branch": "fix/rollover",
+            "statusSha256": "b" * 64,
+        },
+        "patch": {"kind": "git_diff", "sha256": "c" * 64, "bytes": 12},
+        "tests": {"status": "not_run", "commands": []},
+        "blockers": {"status": "clear", "evidence": ["managed rollover"]},
+        "nextAction": "Continue the current issue from the durable workspace.",
+    }
+    monkeypatch.setenv("HERMES_RUN_RESULT_FILE", str(target))
+
+    cli_mod._write_quiet_result_file(
+        {
+            "failed": True,
+            "partial": True,
+            "stop_reason": "session_rollover_required",
+            "turn_exit_reason": "session_rollover_required",
+            "execution_checkpoint": checkpoint,
+        },
+        "session-before-rollover",
+    )
+
+    assert json.loads(target.read_text())["execution_checkpoint"] == checkpoint
+
+
+def test_quiet_result_keeps_usage_and_provider_evidence_without_response_text(monkeypatch, tmp_path):
+    import cli as cli_mod
+
+    target = tmp_path / "run-result.json"
+    monkeypatch.setenv("HERMES_RUN_RESULT_FILE", str(target))
+    cli_mod._write_quiet_result_file({
+        "provider": "openrouter", "model": "kimi", "api_calls": 2,
+        "successful_provider_responses": 2,
+        "input_tokens": 234, "output_tokens": 45,
+        "cache_read_tokens": 20, "cache_write_tokens": 0,
+        "estimated_cost_usd": 0.001, "cost_status": "estimated",
+        "provider_request_ids": ["gen-provider-1"],
+        "usage_telemetry_complete": True,
+        "final_response": "private task body must not persist",
+    }, "session-1")
+
+    report = json.loads(target.read_text())
+    assert report["version"] == 2
+    assert (report["provider"], report["model"], report["api_calls"]) == ("openrouter", "kimi", 2)
+    assert report["successful_provider_responses"] == 2
+    assert (report["input_tokens"], report["output_tokens"], report["cache_read_tokens"]) == (234, 45, 20)
+    assert report["estimated_cost_usd"] == 0.001
+    assert report["usage_telemetry_complete"] is True
+    assert report["cost_unavailable_reason"] is None
+    assert report["provider_request_ids"] == ["gen-provider-1"]
+    assert "private task body" not in target.read_text()
+
+
+def test_unknown_cost_does_not_become_free(monkeypatch, tmp_path):
+    import cli as cli_mod
+
+    target = tmp_path / "run-result.json"
+    monkeypatch.setenv("HERMES_RUN_RESULT_FILE", str(target))
+    cli_mod._write_quiet_result_file({
+        "provider": "openai-codex", "model": "gpt-test", "api_calls": 1,
+        "successful_provider_responses": 1, "usage_telemetry_complete": True,
+        "input_tokens": 100, "output_tokens": 20,
+        "estimated_cost_usd": 0.0, "cost_status": "unknown",
+    }, "session-1")
+
+    report = json.loads(target.read_text())
+    assert report["estimated_cost_usd"] is None
+    assert report["cost_unavailable_reason"] == "cost_not_reported"
+    assert (report["input_tokens"], report["output_tokens"]) == (100, 20)
+
+
+def test_actual_provider_cost_remains_available_in_quiet_result(monkeypatch, tmp_path):
+    target = tmp_path / "run-result.json"
+    monkeypatch.setenv("HERMES_RUN_RESULT_FILE", str(target))
+    cli._write_quiet_result_file({
+        "provider": "test", "model": "test-model", "api_calls": 1,
+        "successful_provider_responses": 1, "usage_telemetry_complete": True,
+        "input_tokens": 10, "output_tokens": 2,
+        "estimated_cost_usd": 0.002, "cost_status": "actual",
+        "cost_source": "provider_cost_api",
+    }, "session-1")
+    report = json.loads(target.read_text())
+    assert report["estimated_cost_usd"] == 0.002
+    assert report["cost_status"] == "actual"
+    assert report["cost_source"] == "provider_cost_api"
+
+
+def test_unsupported_reported_cost_does_not_claim_actual_charge(monkeypatch, tmp_path):
+    target = tmp_path / "run-result.json"
+    monkeypatch.setenv("HERMES_RUN_RESULT_FILE", str(target))
+    cli._write_quiet_result_file({
+        "provider": "test", "model": "test-model", "api_calls": 1,
+        "successful_provider_responses": 1, "usage_telemetry_complete": True,
+        "input_tokens": 10, "output_tokens": 2,
+        "estimated_cost_usd": 0.002, "cost_status": "reported",
+    }, "session-1")
+    report = json.loads(target.read_text())
+    assert report["estimated_cost_usd"] is None
+    assert report["cost_unavailable_reason"] == "cost_not_reported"
+
+
+@pytest.mark.parametrize("base_url, expected", [
+    ("https://openrouter.ai/api/v1?api_key=synthetic-private", "openrouter_api"),
+    ("https://unfamiliar.example/v1?api_key=synthetic-private", "unknown"),
+])
+def test_quiet_result_classifies_endpoint_without_persisting_url(monkeypatch, tmp_path, base_url, expected):
+    target = tmp_path / "run-result.json"
+    monkeypatch.setenv("HERMES_RUN_RESULT_FILE", str(target))
+    cli._write_quiet_result_file({
+        "provider": "custom", "model": "example-model", "api_calls": 1,
+        "successful_provider_responses": 1, "usage_telemetry_complete": True,
+        "input_tokens": 10, "output_tokens": 2, "base_url": base_url,
+    }, "session-1")
+    report = json.loads(target.read_text())
+    assert report["endpoint_class"] == expected
+    assert "synthetic-private" not in target.read_text()
+    assert base_url not in target.read_text()
