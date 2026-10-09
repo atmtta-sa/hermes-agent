@@ -14,6 +14,7 @@ import shutil
 import sys
 import json
 import re
+import uuid
 import atexit
 import errno
 import time

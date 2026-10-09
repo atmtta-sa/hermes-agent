@@ -231,7 +231,12 @@ def _request_budget_stop_reason(agent: Any, messages: Any) -> str | None:
     return _input_budget_stop_reason(agent, estimated) or _cost_budget_stop_reason(agent, estimated)
 
 
-def _request_budget_stop_verdict(agent: Any, messages: Any, request_logger: Any) -> IterationPrep | None:
+def _request_budget_stop_verdict(
+    agent: Any,
+    messages: Any,
+    request_logger: Any,
+    current_turn_user_idx: Any,
+) -> IterationPrep | None:
     reason = _request_budget_stop_reason(agent, messages)
     if not reason:
         return None
@@ -241,7 +246,12 @@ def _request_budget_stop_verdict(agent: Any, messages: Any, request_logger: Any)
         reason,
         getattr(agent, "session_id", None) or "-",
     )
-    return IterationPrep(action="stop", messages=messages, request_logger=request_logger)
+    return IterationPrep(
+        action="stop",
+        messages=messages,
+        request_logger=request_logger,
+        current_turn_user_idx=current_turn_user_idx,
+    )
 
 
 def prepare_iteration(
@@ -260,7 +270,12 @@ def prepare_iteration(
     )
 
     request_logger = getattr(agent, "logger", None) or logger
-    budget_stop = _request_budget_stop_verdict(agent, messages, request_logger)
+    budget_stop = _request_budget_stop_verdict(
+        agent,
+        messages,
+        request_logger,
+        current_turn_user_idx,
+    )
     if budget_stop is not None:
         return budget_stop
 
