@@ -153,6 +153,24 @@ def test_synthetic_stream_id_is_not_provider_request_evidence(tmp_path, monkeypa
         agent.close()
 
 
+def test_local_api_duration_cannot_certify_provider_runtime(tmp_path, monkeypatch, caplog):
+    from agent import provider_transport_evidence
+
+    agent = _agent(tmp_path, monkeypatch)
+    reasons = []
+    monkeypatch.setattr(
+        provider_transport_evidence, "mark_unknown",
+        lambda _agent, reason: reasons.append(reason),
+    )
+    try:
+        _line(agent, caplog, SimpleNamespace(
+            usage=_usage(0, 0, 100), id="provider-response-1",
+        ))
+        assert reasons == ["provider_runtime_authority_missing"]
+    finally:
+        agent.close()
+
+
 def test_forensics_parser_reads_the_new_fields(tmp_path):
     from evals.postmortem.forensics.logcalls import parse_logs
     log = tmp_path / "agent.log"

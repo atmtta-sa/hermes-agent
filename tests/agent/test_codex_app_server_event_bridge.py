@@ -388,6 +388,11 @@ class TestBridgeWiredInRuntime:
         assert callable(captured["on_event"]), (
             "on_event must be the bridge callable, not None or a sentinel"
         )
+        assert callable(captured["on_transport_dispatch"])
+        agent._provider_transport_attempt_id = "prepared-attempt"
+        captured["on_transport_dispatch"]()
+        assert agent._provider_transport_uncertain is True
+        assert getattr(agent, "_provider_transport_dispatched", False) is False
 
         # And the bridge must actually drive the agent's callbacks when
         # fed a representative notification.

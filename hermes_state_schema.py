@@ -974,7 +974,11 @@ class SessionSchemaMixin:
             now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
             cursor.executemany(
                 "INSERT OR IGNORE INTO state_meta (key, value) VALUES (?, ?)",
-                [("store_instance_id", str(uuid.uuid4())), ("store_created_at_utc", now_iso)],
+                [
+                    ("store_instance_id", str(uuid.uuid4())),
+                    ("store_created_at_utc", now_iso),
+                    ("provider_evidence_contract_version", "2"),
+                ],
             )
         else:
             self._run_data_migrations(cursor, row[0], fts5_available)
@@ -984,11 +988,21 @@ class SessionSchemaMixin:
             self._init_fts(cursor)
         self._conn.commit()
 
+    @staticmethod
+    def _migrate_provider_evidence_contract(cursor: sqlite3.Cursor, current_version: int) -> None:
+        if current_version < 32:
+            cursor.execute(
+                "INSERT OR REPLACE INTO state_meta (key, value) VALUES (?, ?)",
+                ("provider_evidence_contract_version", "2"),
+            )
+
     def _run_data_migrations(self, cursor: sqlite3.Cursor, current_version: int, fts5_available: bool) -> None:
         """Version-gated chain for DATA migrations only (row backfills); column additions never
         belong here. Advances schema_version at the end unless FTS5 is unavailable."""
         # Renew the lease: the chain can rewrite whole tables on large DBs.
         report_startup_progress(600.0, phase="state_db_data_migrations")
+        self._migrate_provider_evidence_contract(cursor, current_version)
+
         # (v10 trigram backfill and v11 inline FTS re-index were superseded by v23 and removed.)
         # v11 (SUPERSEDED by v23): re-index FTS5 tables to cover tool_name + tool_calls in inline mode
         # (#16751). v23 drops and rebuilds both FTS tables in external-content form, so running the v11

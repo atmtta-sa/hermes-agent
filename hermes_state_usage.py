@@ -82,6 +82,107 @@ _MODEL_USAGE_FIELDS = frozenset((
 class SessionUsageMixin:
     """Coalesced token writer, per-model usage rows, billing route."""
 
+    def prepare_provider_transport(
+        self, attempt_id: str, *, execution_run_id: str, session_id: str, sequence: int,
+        iteration_attempt: int, provider: str, model: str, billing_base_url: str,
+        pricing_json: str,
+    ) -> None:
+        """Durably identify one exact-run iteration before it may cross transport."""
+        now = time.time()
+        self._execute_write(lambda conn: conn.execute(
+            """INSERT INTO provider_transport_attempts (
+                   attempt_id, contract_version, execution_run_id, session_id, sequence,
+                   iteration_attempt, state, provider, model, billing_base_url,
+                   pricing_json, started_at
+               ) VALUES (?, 2, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?)""",
+            (attempt_id, execution_run_id, session_id, sequence, iteration_attempt,
+             provider, model, billing_base_url or "", pricing_json, now),
+        ))
+
+    def mark_provider_transport_dispatched(self, attempt_id: str) -> None:
+        """Move a prepared attempt across the provider-transport boundary exactly once."""
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE provider_transport_attempts
+                      SET state = 'dispatched', dispatched_at = ?
+                    WHERE attempt_id = ? AND state = 'prepared'""",
+                (now, attempt_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("provider_transport_dispatch_transition_invalid")
+        self._execute_write(_do)
+
+    def deny_provider_transport_pretransport(self, attempt_id: str, reason: str) -> None:
+        """Seal a prepared attempt as denied without claiming provider activity."""
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE provider_transport_attempts
+                      SET state = 'denied_pretransport', completed_at = ?, denial_reason = ?
+                    WHERE attempt_id = ? AND state = 'prepared' AND dispatched_at IS NULL""",
+                (now, reason, attempt_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("provider_transport_denial_transition_invalid")
+        self._execute_write(_do)
+
+    def mark_provider_transport_unknown(self, attempt_id: str, error_text: str) -> None:
+        """Seal an attempt whose upstream crossing or outcome cannot be confirmed."""
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE provider_transport_attempts
+                      SET state = 'outcome_unknown', completed_at = ?, error_text = ?
+                    WHERE attempt_id = ? AND state IN ('prepared', 'dispatched')""",
+                (now, error_text[:2000], attempt_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("provider_transport_unknown_transition_invalid")
+        self._execute_write(_do)
+
+    def complete_provider_transport(
+        self, attempt_id: str, *, provider_request_id: str, input_tokens: int,
+        output_tokens: int, runtime_ms: int, estimated_cost_usd: Optional[float],
+        cost_microusd: Optional[int], cost_basis: str, cost_authority: Optional[str],
+        cost_authority_ref: Optional[str],
+    ) -> None:
+        """Atomically attach confirmed usage and seal a dispatched transport."""
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                """SELECT session_id, sequence, provider, model, billing_base_url
+                     FROM provider_transport_attempts
+                    WHERE attempt_id = ? AND state = 'dispatched'""",
+                (attempt_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("provider_transport_completion_transition_invalid")
+            conn.execute(
+                """INSERT INTO provider_call_usage (
+                       attempt_id, session_id, sequence, provider_request_id, provider,
+                       model, billing_base_url, input_tokens, output_tokens, runtime_ms,
+                       runtime_basis, estimated_cost_usd, cost_microusd, cost_basis,
+                       cost_authority, cost_authority_ref, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (attempt_id, row["session_id"], row["sequence"], provider_request_id,
+                 row["provider"], row["model"], row["billing_base_url"],
+                 input_tokens, output_tokens, runtime_ms, "confirmed_provider_call_ms_v1",
+                 estimated_cost_usd, cost_microusd, cost_basis, cost_authority,
+                 cost_authority_ref, now),
+            )
+            conn.execute(
+                """UPDATE provider_transport_attempts
+                      SET state = 'completed', provider_request_id = ?, completed_at = ?
+                    WHERE attempt_id = ?""",
+                (provider_request_id, now, attempt_id),
+            )
+        self._execute_write(_do)
+
     def update_session_billing_route(
         self, session_id: str, *, provider: str, base_url: str, billing_mode: Optional[str] = None,
     ) -> None:

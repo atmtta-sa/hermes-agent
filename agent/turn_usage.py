@@ -231,6 +231,8 @@ def record_response_usage(
             and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", response_id)):
         agent.session_provider_request_ids.append(response_id)
     if not (hasattr(response, 'usage') and response.usage):
+        from agent.provider_transport_evidence import mark_unknown
+        mark_unknown(agent, "provider_response_usage_missing")
         _record_missing_usage(agent, compressor, api_duration)
         return ResponseUsageOutcome(compression_attempts=compression_attempts)
 
@@ -271,6 +273,11 @@ def record_response_usage(
     cost_delta, cost_status, cost_source = _record_response_cost(
         agent, response, aggregator_usage, _moa_client, _moa_ref_cost,
     )
+    from agent.provider_transport_evidence import mark_unknown
+    if isinstance(response_id, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", response_id):
+        mark_unknown(agent, "provider_runtime_authority_missing")
+    else:
+        mark_unknown(agent, "provider_response_identity_missing")
     _queue_response_usage(agent, canonical_usage, total_tokens, cost_delta, cost_status, cost_source)
 
     display_usage(agent, usage_dict, canonical_usage)

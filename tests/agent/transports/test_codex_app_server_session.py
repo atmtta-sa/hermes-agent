@@ -186,6 +186,25 @@ class TestLifecycle:
 # ---- turn loop ----
 
 class TestRunTurn:
+    def test_transport_dispatch_callback_fires_immediately_before_turn_start(self):
+        client = FakeClient()
+        observed_requests = []
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        session = make_session(
+            client,
+            on_transport_dispatch=lambda: observed_requests.append(list(client.requests)),
+        )
+
+        result = session.run_turn("hi", turn_timeout=2.0)
+
+        assert result.error is None
+        assert len(observed_requests) == 1
+        assert [method for method, _ in observed_requests[0]] == ["thread/start"]
+        assert [method for method, _ in client.requests].count("turn/start") == 1
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})

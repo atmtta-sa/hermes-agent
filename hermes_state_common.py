@@ -230,7 +230,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
         f"(SELECT started_at FROM sessions _act_s WHERE _act_s.id = {session_id_expr})")
 
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 32
 
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
 # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA
@@ -442,6 +442,53 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS provider_transport_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    contract_version INTEGER NOT NULL,
+    execution_run_id TEXT NOT NULL,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL,
+    iteration_attempt INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'prepared', 'denied_pretransport', 'dispatched', 'completed',
+        'failed_after_dispatch', 'outcome_unknown'
+    )),
+    provider_request_id TEXT,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    billing_base_url TEXT NOT NULL DEFAULT '',
+    pricing_json TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    dispatched_at REAL,
+    completed_at REAL,
+    denial_reason TEXT,
+    error_text TEXT,
+    UNIQUE (execution_run_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS provider_transport_attempts_exact_run
+    ON provider_transport_attempts(execution_run_id, started_at, attempt_id);
+
+CREATE TABLE IF NOT EXISTS provider_call_usage (
+    attempt_id TEXT PRIMARY KEY REFERENCES provider_transport_attempts(attempt_id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL,
+    provider_request_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    billing_base_url TEXT NOT NULL DEFAULT '',
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    runtime_ms INTEGER NOT NULL,
+    runtime_basis TEXT NOT NULL DEFAULT 'confirmed_provider_call_ms_v1',
+    estimated_cost_usd REAL,
+    cost_microusd INTEGER,
+    cost_basis TEXT NOT NULL DEFAULT 'local_estimate',
+    cost_authority TEXT,
+    cost_authority_ref TEXT,
+    created_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS gateway_routing (
