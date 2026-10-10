@@ -80,37 +80,45 @@ def perform_api_call(
     _use_streaming = _should_stream(agent)
 
     def _perform_api_call(next_api_kwargs):
+        from agent.provider_transport_evidence import prepare_if_needed, run_dispatched_transport
+        prepare_if_needed(
+            agent, iteration_attempt=int(api_call_count), retry_attempt=int(retry_count),
+        )
         if agent.api_mode == "codex_responses":
             next_api_kwargs = agent._get_transport().preflight_kwargs(
                 next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),
                 sanitize_harmony_tokens=agent._is_codex_backend(),
             )
-        if _use_streaming:
-            return agent._interruptible_streaming_api_call(
-                next_api_kwargs, on_first_delta=_stop_spinner
-            )
-        from agent import relay_llm
 
-        return relay_llm.execute(
-            next_api_kwargs,
-            agent._interruptible_api_call,
-            session_id=str(agent.session_id or ""),
-            name=str(agent.provider or "provider"),
-            model_name=str(agent.model or ""),
-            metadata={
-                "api_mode": agent.api_mode,
-                "api_request_id": api_request_id,
-                "call_role": (
-                    "delegated"
-                    if getattr(agent, "is_subagent", False)
-                    else "fallback"
-                    if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                    else "primary"
-                ),
-                "retry_count": retry_count,
-            },
-            defer_logical_completion=True,
-        )
+        def _transport():
+            if _use_streaming:
+                return agent._interruptible_streaming_api_call(
+                    next_api_kwargs, on_first_delta=_stop_spinner
+                )
+            from agent import relay_llm
+
+            return relay_llm.execute(
+                next_api_kwargs,
+                agent._interruptible_api_call,
+                session_id=str(agent.session_id or ""),
+                name=str(agent.provider or "provider"),
+                model_name=str(agent.model or ""),
+                metadata={
+                    "api_mode": agent.api_mode,
+                    "api_request_id": api_request_id,
+                    "call_role": (
+                        "delegated"
+                        if getattr(agent, "is_subagent", False)
+                        else "fallback"
+                        if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                        else "primary"
+                    ),
+                    "retry_count": retry_count,
+                },
+                defer_logical_completion=True,
+            )
+
+        return run_dispatched_transport(agent, _transport)
 
     from hermes_cli.middleware import run_llm_execution_middleware
 
@@ -122,13 +130,19 @@ def perform_api_call(
     with _bracket:
         if _model_request_active is not None:
             _model_request_active.set()
-    try:
-        response = run_llm_execution_middleware(
+    def _run_middleware():
+        return run_llm_execution_middleware(
             api_kwargs, _perform_api_call, original_request=_original_api_kwargs,
             task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
             session_id=agent.session_id or "", platform=agent.platform or "", model=agent.model,
             provider=agent.provider, base_url=agent.base_url, api_mode=agent.api_mode,
             api_call_count=api_call_count, middleware_trace=list(_llm_middleware_trace),
+        )
+
+    from agent.provider_transport_evidence import run_with_pretransport_denial
+    try:
+        response = run_with_pretransport_denial(
+            agent, _run_middleware, "middleware_pretransport_denial",
         )
     finally:
         with _bracket:
@@ -141,6 +155,8 @@ def perform_api_call(
     if _redirect_crossed_response:
         # Response and redirect can cross threads: discard the now-stale
         # response and rebuild from the correction rather than lose it.
+        from agent.provider_transport_evidence import mark_unknown
+        mark_unknown(agent, "provider_response_discarded_by_redirect")
         thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
         if agent.clear_interrupt(preserve_redirect=True):
             _retry.restart_with_redirected_messages = True

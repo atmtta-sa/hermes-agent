@@ -96,6 +96,10 @@ def check_api_response(
     from agent.turn_recovery import validate_response_shape
 
     def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> ResponseCheckVerdict:
+        from agent.provider_transport_evidence import record_transport_failure
+        record_transport_failure(
+            agent, "provider_response_not_accountable", "provider_response_pretransport_failure",
+        )
         return ResponseCheckVerdict(
             action=action, thinking_spinner=thinking_spinner, messages=messages,
             active_system_prompt=active_system_prompt, finish_reason=finish_reason,

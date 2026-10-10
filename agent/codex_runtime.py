@@ -410,10 +410,13 @@ def _ensure_codex_session(agent) -> None:
     # _emit_interim_assistant_message). Without this, Discord/Telegram users see no live tool-progress or
     # interim commentary while codex_app_server is running — only the final answer (#33200). Supersedes the
     # narrower item/started-only bridge from #38835.
+    from agent.provider_transport_evidence import mark_transport_uncertain
+
     agent._codex_session = CodexAppServerSession(
         cwd=getattr(agent, "session_cwd", None) or str(resolve_agent_cwd()), approval_callback=approval_callback,
         request_routing=_ServerRequestRouting(auto_approve_exec=auto_approve_requests, auto_approve_apply_patch=auto_approve_requests),
         on_event=make_codex_app_server_event_bridge(agent),
+        on_transport_dispatch=lambda: mark_transport_uncertain(agent),
     )
 
 
@@ -484,11 +487,18 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         from agent.conversation_compression import _checkpoint_blocked
         raise _checkpoint_blocked("codex_app_server owns the authoritative thread and compacts it "
                                   "without a truthful pre-compaction transcript boundary")
-    _ensure_codex_session(agent)
+    from agent.provider_transport_evidence import (
+        finalize_codex_transport, prepare_if_needed, record_transport_failure,
+    )
+    prepare_if_needed(
+        agent, iteration_attempt=int(getattr(agent, "session_api_calls", 0) or 0) + 1,
+    )
     try:
+        _ensure_codex_session(agent)
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
+        record_transport_failure(agent, exc, "codex_app_server_pretransport_failure")
         _close_codex_session(agent)
         return _turn_result(
             _consume_user_interrupt(agent), messages, api_calls=0, completed=False, error=str(exc),
@@ -503,6 +513,7 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     usage_result = _finish_codex_turn(
         agent, turn, messages, original_user_message=original_user_message, should_review_memory=should_review_memory,
     )
+    finalize_codex_transport(agent, turn, usage_result)
     return _turn_result(
         interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,
         # We flushed the projected rows ourselves (agent_persisted); the gateway must skip its own DB write.

@@ -153,6 +153,7 @@ class CodexAppServerSession:
         codex_home: Optional[str] = None, permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        on_transport_dispatch: Optional[Callable[[], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
     ) -> None:
@@ -164,6 +165,7 @@ class CodexAppServerSession:
         )
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
+        self._on_transport_dispatch = on_transport_dispatch
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
 
@@ -278,6 +280,8 @@ class CodexAppServerSession:
     def _request_for(self, result: TurnResult, method: str, params: dict, label: str) -> Optional[dict]:
         """Issue ``method``; on failure fill ``result.error`` and return None. A timeout always retires."""
         try:
+            if method == "turn/start" and self._on_transport_dispatch is not None:
+                self._on_transport_dispatch()
             return self._client.request(method, params, timeout=10)
         except CodexAppServerError as exc:
             self._set_classified_error(result, f"{label} failed", exc.message, exc)

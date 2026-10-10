@@ -254,6 +254,33 @@ def _request_budget_stop_verdict(
     )
 
 
+def _prepare_transport_or_budget_stop(
+    agent: Any,
+    messages: Any,
+    request_logger: Any,
+    current_turn_user_idx: Any,
+    api_call_count: Any,
+) -> IterationPrep | None:
+    from agent.provider_transport_evidence import deny_pretransport, prepare_transport
+
+    budget_stop = _request_budget_stop_verdict(
+        agent, messages, request_logger, current_turn_user_idx,
+    )
+    if budget_stop is None:
+        return None
+    try:
+        prepare_transport(agent, iteration_attempt=int(api_call_count))
+    except Exception:
+        agent._request_budget_stop_reason = "provider_evidence_schema_unavailable"
+        request_logger.exception("Managed provider evidence is unavailable; stopping before transport")
+        return IterationPrep(
+            action="stop", messages=messages, request_logger=request_logger,
+            current_turn_user_idx=current_turn_user_idx,
+        )
+    deny_pretransport(agent, str(agent._request_budget_stop_reason))
+    return budget_stop
+
+
 def prepare_iteration(
     agent: Any,
     *,
@@ -270,11 +297,8 @@ def prepare_iteration(
     )
 
     request_logger = getattr(agent, "logger", None) or logger
-    budget_stop = _request_budget_stop_verdict(
-        agent,
-        messages,
-        request_logger,
-        current_turn_user_idx,
+    budget_stop = _prepare_transport_or_budget_stop(
+        agent, messages, request_logger, current_turn_user_idx, api_call_count,
     )
     if budget_stop is not None:
         return budget_stop

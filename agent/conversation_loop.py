@@ -1413,6 +1413,10 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
             if _run_phase(handle_api_interrupt, agent, s).action == "break":
                 return None
         except Exception as api_error:
+            from agent.provider_transport_evidence import record_transport_failure
+            record_transport_failure(
+                agent, api_error, "provider_attempt_failed_before_transport",
+            )
             _ae = _run_phase(handle_api_error, agent, s, api_error=api_error)
             if _ae.action == "return":
                 return _ae.result
