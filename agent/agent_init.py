@@ -320,7 +320,10 @@ def _normalize_run_budget_seconds(value) -> Optional[float]:
 
 def _load_autonomous_budget_envelope(
     environ: Mapping[str, str],
-) -> tuple[bool, Dict[str, int | float]]:
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+) -> tuple[bool, Dict[str, int | float | bool | None]]:
     """Load Paperclip's complete reserved envelope; partial data is never applied."""
     if not environ.get("PAPERCLIP_RUN_ID"):
         return False, {}
@@ -341,20 +344,47 @@ def _load_autonomous_budget_envelope(
     if set(payload) != set(names):
         return True, {}
     values = {name: payload.get(name) for name in names}
+    non_cost_values = {name: value for name, value in values.items() if name != "costMicrousd"}
     if any(
         not isinstance(value, int) or isinstance(value, bool) or value <= 0
-        for value in values.values()
+        for value in non_cost_values.values()
     ):
         return True, {}
-    validated = cast(Dict[str, int], values)
+    cost_microusd = values["costMicrousd"]
+    cost_budget_applicable = cost_microusd is not None
+    if cost_budget_applicable:
+        if not isinstance(cost_microusd, int) or isinstance(cost_microusd, bool) or cost_microusd <= 0:
+            return True, {}
+    else:
+        try:
+            route_policy = json.loads(environ.get("HERMES_BILLING_ROUTE_POLICY_JSON", ""))
+        except (TypeError, ValueError):
+            return True, {}
+        from agent.provider_transport_evidence import billing_route_policy_is_valid
+
+        if not (
+            isinstance(route_policy, dict)
+            and billing_route_policy_is_valid(
+                provider=str(provider or ""),
+                model=str(model or ""),
+                policy=route_policy,
+            )
+        ):
+            return True, {}
+    validated_non_cost = cast(Dict[str, int], non_cost_values)
 
     return True, {
-        "max_request_input_tokens": min(64_000, validated["inputTokens"]),
-        "max_cumulative_input_tokens": validated["inputTokens"],
-        "max_cumulative_output_tokens": validated["outputTokens"],
-        "max_model_requests_per_run": validated["requestCount"],
-        "max_run_seconds": validated["runtimeMs"] / 1_000,
-        "max_estimated_cost_usd": validated["costMicrousd"] / 1_000_000,
+        "max_request_input_tokens": min(64_000, validated_non_cost["inputTokens"]),
+        "max_cumulative_input_tokens": validated_non_cost["inputTokens"],
+        "max_cumulative_output_tokens": validated_non_cost["outputTokens"],
+        "max_model_requests_per_run": validated_non_cost["requestCount"],
+        "max_run_seconds": validated_non_cost["runtimeMs"] / 1_000,
+        "max_estimated_cost_usd": (
+            cost_microusd / 1_000_000
+            if isinstance(cost_microusd, int) and not isinstance(cost_microusd, bool)
+            else None
+        ),
+        "autonomous_cost_budget_applicable": cost_budget_applicable,
     }
 
 
@@ -715,7 +745,11 @@ def _init_turn_state(agent, run_budget_seconds):
     # Wall-clock run budget per turn: constructor arg wins, else agent.run_budget_seconds
     # (in _apply_agent_section). None = fully off (no clock reads, injection, or capping).
     agent.run_budget_seconds = _normalize_run_budget_seconds(run_budget_seconds)
-    required, limits = _load_autonomous_budget_envelope(os.environ)
+    required, limits = _load_autonomous_budget_envelope(
+        os.environ,
+        provider=str(getattr(agent, "provider", "") or ""),
+        model=str(getattr(agent, "model", "") or ""),
+    )
     agent.autonomous_budget_required = required
     for name in (
         "max_request_input_tokens",
@@ -724,6 +758,7 @@ def _init_turn_state(agent, run_budget_seconds):
         "max_model_requests_per_run",
         "max_run_seconds",
         "max_estimated_cost_usd",
+        "autonomous_cost_budget_applicable",
     ):
         setattr(agent, name, limits.get(name))
     from agent.credits_tracker import new_credits_latch

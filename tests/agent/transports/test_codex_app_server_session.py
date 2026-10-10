@@ -228,8 +228,6 @@ class TestRunTurn:
         # turn_id propagated for downstream session-DB linkage
         assert r.turn_id == "turn-fake-001"
 
-
-
     def test_result_records_the_exact_submitted_input(self):
         client = FakeClient()
         client.queue_notification(

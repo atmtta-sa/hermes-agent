@@ -273,9 +273,22 @@ def record_response_usage(
     cost_delta, cost_status, cost_source = _record_response_cost(
         agent, response, aggregator_usage, _moa_client, _moa_ref_cost,
     )
-    from agent.provider_transport_evidence import mark_unknown
+    from agent.provider_transport_evidence import (
+        complete_subscription_transport_without_runtime,
+        mark_unknown,
+    )
     if isinstance(response_id, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", response_id):
-        mark_unknown(agent, "provider_runtime_authority_missing")
+        completed = complete_subscription_transport_without_runtime(
+            agent,
+            provider_request_id=response_id,
+            input_tokens=canonical_usage.input_tokens,
+            output_tokens=canonical_usage.output_tokens,
+            cost_usd=cost_delta,
+            cost_status=cost_status,
+            cost_source=cost_source,
+        )
+        if not completed:
+            mark_unknown(agent, "provider_runtime_authority_missing")
     else:
         mark_unknown(agent, "provider_response_identity_missing")
     _queue_response_usage(agent, canonical_usage, total_tokens, cost_delta, cost_status, cost_source)

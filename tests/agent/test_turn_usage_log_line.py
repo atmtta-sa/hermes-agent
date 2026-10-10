@@ -171,6 +171,35 @@ def test_local_api_duration_cannot_certify_provider_runtime(tmp_path, monkeypatc
         agent.close()
 
 
+def test_subscription_route_completes_without_provider_runtime(tmp_path, monkeypatch, caplog):
+    from agent import provider_transport_evidence
+
+    agent = _agent(tmp_path, monkeypatch)
+    completed = []
+    reasons = []
+    monkeypatch.setattr(
+        provider_transport_evidence,
+        "complete_subscription_transport_without_runtime",
+        lambda _agent, **kwargs: completed.append(kwargs) or True,
+    )
+    monkeypatch.setattr(
+        provider_transport_evidence,
+        "mark_unknown",
+        lambda _agent, reason: reasons.append(reason),
+    )
+    try:
+        _line(agent, caplog, SimpleNamespace(
+            usage=_usage(0, 0, 100), id="provider-response-subscription-1",
+        ))
+        assert reasons == []
+        assert len(completed) == 1
+        assert completed[0]["provider_request_id"] == "provider-response-subscription-1"
+        assert completed[0]["input_tokens"] == 100
+        assert completed[0]["output_tokens"] == 7
+    finally:
+        agent.close()
+
+
 def test_forensics_parser_reads_the_new_fields(tmp_path):
     from evals.postmortem.forensics.logcalls import parse_logs
     log = tmp_path / "agent.log"
