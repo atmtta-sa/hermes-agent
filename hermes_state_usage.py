@@ -85,7 +85,11 @@ class SessionUsageMixin:
     def prepare_provider_transport(
         self, attempt_id: str, *, execution_run_id: str, session_id: str, sequence: int,
         iteration_attempt: int, provider: str, model: str, billing_base_url: str,
-        pricing_json: str,
+        pricing_json: str, contract_version: int = 2, route_policy_id: Optional[str] = None,
+        route_policy_version: Optional[int] = None, route_policy_digest: Optional[str] = None,
+        credential_principal_id: Optional[str] = None, billing_mode: Optional[str] = None,
+        root_chain_request_limit: Optional[int] = None,
+        charge_applicability: Optional[str] = None, token_accounting_basis: Optional[str] = None,
     ) -> None:
         """Durably identify one exact-run iteration before it may cross transport."""
         now = time.time()
@@ -93,10 +97,14 @@ class SessionUsageMixin:
             """INSERT INTO provider_transport_attempts (
                    attempt_id, contract_version, execution_run_id, session_id, sequence,
                    iteration_attempt, state, provider, model, billing_base_url,
-                   pricing_json, started_at
-               ) VALUES (?, 2, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?)""",
-            (attempt_id, execution_run_id, session_id, sequence, iteration_attempt,
-             provider, model, billing_base_url or "", pricing_json, now),
+                   pricing_json, route_policy_id, route_policy_version, route_policy_digest,
+                   credential_principal_id, billing_mode, root_chain_request_limit,
+                   charge_applicability, token_accounting_basis, started_at
+               ) VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (attempt_id, contract_version, execution_run_id, session_id, sequence, iteration_attempt,
+             provider, model, billing_base_url or "", pricing_json, route_policy_id,
+             route_policy_version, route_policy_digest, credential_principal_id, billing_mode,
+             root_chain_request_limit, charge_applicability, token_accounting_basis, now),
         ))
 
     def mark_provider_transport_dispatched(self, attempt_id: str) -> None:
@@ -146,9 +154,11 @@ class SessionUsageMixin:
 
     def complete_provider_transport(
         self, attempt_id: str, *, provider_request_id: str, input_tokens: int,
-        output_tokens: int, runtime_ms: int, estimated_cost_usd: Optional[float],
+        output_tokens: int, runtime_ms: Optional[int], estimated_cost_usd: Optional[float],
         cost_microusd: Optional[int], cost_basis: str, cost_authority: Optional[str],
-        cost_authority_ref: Optional[str],
+        cost_authority_ref: Optional[str], billing_mode: Optional[str] = None,
+        charge_applicability: Optional[str] = None, monetary_currency: Optional[str] = None,
+        token_accounting_basis: Optional[str] = None,
     ) -> None:
         """Atomically attach confirmed usage and seal a dispatched transport."""
         now = time.time()
@@ -166,14 +176,18 @@ class SessionUsageMixin:
                 """INSERT INTO provider_call_usage (
                        attempt_id, session_id, sequence, provider_request_id, provider,
                        model, billing_base_url, input_tokens, output_tokens, runtime_ms,
-                       runtime_basis, estimated_cost_usd, cost_microusd, cost_basis,
-                       cost_authority, cost_authority_ref, created_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       runtime_basis, runtime_applicability, estimated_cost_usd, cost_microusd, cost_basis,
+                       cost_authority, cost_authority_ref, billing_mode, charge_applicability,
+                       monetary_currency, token_accounting_basis, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (attempt_id, row["session_id"], row["sequence"], provider_request_id,
                  row["provider"], row["model"], row["billing_base_url"],
-                 input_tokens, output_tokens, runtime_ms, "confirmed_provider_call_ms_v1",
+                 input_tokens, output_tokens, runtime_ms,
+                 "confirmed_provider_call_ms_v1" if runtime_ms is not None else None,
+                 "available" if runtime_ms is not None else "unavailable_by_route",
                  estimated_cost_usd, cost_microusd, cost_basis, cost_authority,
-                 cost_authority_ref, now),
+                 cost_authority_ref, billing_mode, charge_applicability, monetary_currency,
+                 token_accounting_basis, now),
             )
             conn.execute(
                 """UPDATE provider_transport_attempts

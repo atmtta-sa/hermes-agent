@@ -284,7 +284,106 @@ def test_paperclip_envelope_maps_all_reserved_dimensions():
         "max_model_requests_per_run": 8,
         "max_run_seconds": 900.0,
         "max_estimated_cost_usd": 0.25,
+        "autonomous_cost_budget_applicable": True,
     }
+
+
+def test_subscription_envelope_accepts_explicit_non_applicable_cost():
+    policy = {
+        "policyId": "subscription-policy",
+        "policyVersion": 1,
+        "policyDigest": "a" * 64,
+        "provider": "openai-codex",
+        "route": "https://chatgpt.com/backend-api/codex",
+        "credentialPrincipalId": "managed-account:test",
+        "modelScope": ["gpt-5.6-sol"],
+        "billingMode": "subscription_included",
+        "status": "active",
+        "validFrom": "2026-01-01T00:00:00.000Z",
+        "validUntil": "2027-01-01T00:00:00.000Z",
+        "maxRootChainProviderRequests": 8,
+    }
+    required, limits = _load_autonomous_budget_envelope(
+        {
+            "PAPERCLIP_RUN_ID": "run-subscription",
+            "HERMES_AUTONOMOUS_BUDGET_JSON": json.dumps(
+                {
+                    "requestCount": 4,
+                    "inputTokens": 200_000,
+                    "outputTokens": 40_000,
+                    "runtimeMs": 300_000,
+                    "costMicrousd": None,
+                }
+            ),
+            "HERMES_BILLING_ROUTE_POLICY_JSON": json.dumps(policy),
+        },
+        provider="openai-codex",
+        model="gpt-5.6-sol",
+    )
+
+    assert required is True
+    assert limits == {
+        "max_request_input_tokens": 64_000,
+        "max_cumulative_input_tokens": 200_000,
+        "max_cumulative_output_tokens": 40_000,
+        "max_model_requests_per_run": 4,
+        "max_run_seconds": 300.0,
+        "max_estimated_cost_usd": None,
+        "autonomous_cost_budget_applicable": False,
+    }
+
+
+def test_subscription_envelope_rejects_incomplete_route_policy():
+    required, limits = _load_autonomous_budget_envelope(
+        {
+            "PAPERCLIP_RUN_ID": "run-subscription",
+            "HERMES_AUTONOMOUS_BUDGET_JSON": json.dumps(
+                {
+                    "requestCount": 4,
+                    "inputTokens": 200_000,
+                    "outputTokens": 40_000,
+                    "runtimeMs": 300_000,
+                    "costMicrousd": None,
+                }
+            ),
+            "HERMES_BILLING_ROUTE_POLICY_JSON": json.dumps(
+                {
+                    "policyId": "subscription-policy",
+                    "policyVersion": 1,
+                    "policyDigest": "a" * 64,
+                    "credentialPrincipalId": "managed-account:test",
+                    "billingMode": "subscription_included",
+                    "status": "active",
+                    "maxRootChainProviderRequests": 8,
+                }
+            ),
+        },
+        provider="openai-codex",
+        model="gpt-5.6-sol",
+    )
+
+    assert required is True
+    assert limits == {}
+
+
+def test_null_cost_without_subscription_policy_fails_closed():
+    required, limits = _load_autonomous_budget_envelope(
+        {
+            "PAPERCLIP_RUN_ID": "run-metered",
+            "HERMES_AUTONOMOUS_BUDGET_JSON": json.dumps(
+                {
+                    "requestCount": 4,
+                    "inputTokens": 200_000,
+                    "outputTokens": 40_000,
+                    "runtimeMs": 300_000,
+                    "costMicrousd": None,
+                }
+            ),
+        }
+    )
+
+    assert required is True
+    assert limits == {}
 
 
 def test_malformed_paperclip_envelope_cannot_apply_partial_limits():

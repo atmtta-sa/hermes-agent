@@ -230,7 +230,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
         f"(SELECT started_at FROM sessions _act_s WHERE _act_s.id = {session_id_expr})")
 
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
 # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA
@@ -460,6 +460,14 @@ CREATE TABLE IF NOT EXISTS provider_transport_attempts (
     model TEXT NOT NULL,
     billing_base_url TEXT NOT NULL DEFAULT '',
     pricing_json TEXT NOT NULL,
+    route_policy_id TEXT,
+    route_policy_version INTEGER,
+    route_policy_digest TEXT,
+    credential_principal_id TEXT,
+    billing_mode TEXT,
+    root_chain_request_limit INTEGER,
+    charge_applicability TEXT,
+    token_accounting_basis TEXT,
     started_at REAL NOT NULL,
     dispatched_at REAL,
     completed_at REAL,
@@ -481,13 +489,18 @@ CREATE TABLE IF NOT EXISTS provider_call_usage (
     billing_base_url TEXT NOT NULL DEFAULT '',
     input_tokens INTEGER NOT NULL,
     output_tokens INTEGER NOT NULL,
-    runtime_ms INTEGER NOT NULL,
-    runtime_basis TEXT NOT NULL DEFAULT 'confirmed_provider_call_ms_v1',
+    runtime_ms INTEGER,
+    runtime_basis TEXT,
+    runtime_applicability TEXT,
     estimated_cost_usd REAL,
     cost_microusd INTEGER,
     cost_basis TEXT NOT NULL DEFAULT 'local_estimate',
     cost_authority TEXT,
     cost_authority_ref TEXT,
+    billing_mode TEXT,
+    charge_applicability TEXT,
+    monetary_currency TEXT,
+    token_accounting_basis TEXT,
     created_at REAL NOT NULL
 );
 

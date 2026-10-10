@@ -134,7 +134,6 @@ _AUTONOMOUS_BUDGET_FIELDS = (
     "max_cumulative_output_tokens",
     "max_model_requests_per_run",
     "max_run_seconds",
-    "max_estimated_cost_usd",
 )
 
 
@@ -142,6 +141,11 @@ def _missing_budget_envelope_reason(agent: Any) -> str | None:
     if not getattr(agent, "autonomous_budget_required", False):
         return None
     if any(getattr(agent, name, None) is None for name in _AUTONOMOUS_BUDGET_FIELDS):
+        return "autonomous_budget_missing"
+    if (
+        getattr(agent, "autonomous_cost_budget_applicable", True)
+        and getattr(agent, "max_estimated_cost_usd", None) is None
+    ):
         return "autonomous_budget_missing"
     return None
 
@@ -205,6 +209,8 @@ def _input_budget_stop_reason(agent: Any, estimated: int) -> str | None:
 
 
 def _cost_budget_stop_reason(agent: Any, estimated_input: int) -> str | None:
+    if not getattr(agent, "autonomous_cost_budget_applicable", True):
+        return None
     limit = _positive_float(getattr(agent, "max_estimated_cost_usd", None))
     if limit is None:
         return None

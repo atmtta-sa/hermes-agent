@@ -898,6 +898,54 @@ class SessionSchemaMixin:
         finally:
             cursor.execute("PRAGMA foreign_keys=ON")
 
+    def _heal_provider_call_usage_nullable_runtime(self, cursor: sqlite3.Cursor) -> None:
+        """Schema 33: provider runtime is unavailable on some valid routes."""
+        columns = {row[1]: row for row in cursor.execute(
+            'PRAGMA table_info("provider_call_usage")'
+        ).fetchall()}
+        runtime = columns.get("runtime_ms")
+        if runtime is None or runtime[3] == 0:
+            return
+        self._rebuild_table(
+            cursor, "provider_call_usage", "provider_call_usage_legacy_runtime",
+            """CREATE TABLE provider_call_usage (
+    attempt_id TEXT PRIMARY KEY REFERENCES provider_transport_attempts(attempt_id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL,
+    provider_request_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    billing_base_url TEXT NOT NULL DEFAULT '',
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    runtime_ms INTEGER,
+    runtime_basis TEXT,
+    runtime_applicability TEXT,
+    estimated_cost_usd REAL,
+    cost_microusd INTEGER,
+    cost_basis TEXT NOT NULL DEFAULT 'local_estimate',
+    cost_authority TEXT,
+    cost_authority_ref TEXT,
+    billing_mode TEXT,
+    charge_applicability TEXT,
+    monetary_currency TEXT,
+    token_accounting_basis TEXT,
+    created_at REAL NOT NULL
+)""",
+            """INSERT INTO provider_call_usage (
+                attempt_id, session_id, sequence, provider_request_id, provider, model,
+                billing_base_url, input_tokens, output_tokens, runtime_ms, runtime_basis,
+                runtime_applicability, estimated_cost_usd, cost_microusd, cost_basis,
+                cost_authority, cost_authority_ref, billing_mode, charge_applicability,
+                monetary_currency, token_accounting_basis, created_at)
+               SELECT attempt_id, session_id, sequence, provider_request_id, provider, model,
+                billing_base_url, input_tokens, output_tokens, runtime_ms, runtime_basis,
+                runtime_applicability, estimated_cost_usd, cost_microusd, cost_basis,
+                cost_authority, cost_authority_ref, billing_mode, charge_applicability,
+                monetary_currency, token_accounting_basis, created_at
+               FROM provider_call_usage_legacy_runtime""",
+        )
+
     # ── _init_schema ───────────────────────────────────────────────────────
 
     def _init_schema(self):
@@ -925,6 +973,7 @@ class SessionSchemaMixin:
         # already at v22+ when the column landed — the version-gated rebuild is unreachable there, #73823).
         # Same PK-rebuild constraint as gateway_routing above.
         self._heal_session_model_usage_pk(cursor)
+        self._heal_provider_call_usage_nullable_runtime(cursor)
 
         # Indexes referencing reconciler-added columns must be created AFTER _reconcile_columns
         # (in SCHEMA_SQL the executescript would fail on legacy DBs).
@@ -977,7 +1026,7 @@ class SessionSchemaMixin:
                 [
                     ("store_instance_id", str(uuid.uuid4())),
                     ("store_created_at_utc", now_iso),
-                    ("provider_evidence_contract_version", "2"),
+                    ("provider_evidence_contract_version", "3"),
                 ],
             )
         else:
@@ -990,10 +1039,10 @@ class SessionSchemaMixin:
 
     @staticmethod
     def _migrate_provider_evidence_contract(cursor: sqlite3.Cursor, current_version: int) -> None:
-        if current_version < 32:
+        if current_version < 33:
             cursor.execute(
                 "INSERT OR REPLACE INTO state_meta (key, value) VALUES (?, ?)",
-                ("provider_evidence_contract_version", "2"),
+                ("provider_evidence_contract_version", "3"),
             )
 
     def _run_data_migrations(self, cursor: sqlite3.Cursor, current_version: int, fts5_available: bool) -> None:
