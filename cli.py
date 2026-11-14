@@ -4144,6 +4144,8 @@ def _write_quiet_result_file(result: object, session_id: str) -> None:
         "cost_unavailable_reason": None if cost is not None else "cost_not_reported",
         "cost_status": record.get("cost_status"),
         "cost_source": record.get("cost_source"),
+        **({"context_telemetry": record["context_telemetry"]}
+           if isinstance(record.get("context_telemetry"), dict) else {}),
         **_quiet_execution_checkpoint(record),
     }
     path = Path(target).expanduser()
@@ -4236,6 +4238,12 @@ def _run_quiet_single_query(cli, effective_query):
             logger.debug("kanban goal loop failed: %s", _goal_exc)
 
     print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+    if isinstance(result, dict):
+        from agent.effective_request_capture import build_run_context_telemetry
+
+        context_telemetry = build_run_context_telemetry(cli.agent)
+        if context_telemetry is not None:
+            result = {**result, "context_telemetry": context_telemetry}
     _write_quiet_result_file(result, cli.session_id)
 
     # Exit code 0/1 for automation wrappers. Kanban workers that failed purely on
