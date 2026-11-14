@@ -1,6 +1,8 @@
 """Configurable budget constants for tool result persistence.
 Per-tool resolution: pinned > config overrides > registry > default."""
 
+import json
+import os
 from dataclasses import dataclass, field
 from typing import Dict
 
@@ -73,6 +75,36 @@ class BudgetConfig:
         if registry_value == float("inf"):
             return registry_value
         return min(registry_value, self.default_result_size)
+
+
+@dataclass(frozen=True)
+class ManagedToolResultBudget:
+    per_result_bytes: int
+    per_turn_bytes: int
+    per_session_bytes: int
+
+
+def managed_tool_result_budget_from_env() -> ManagedToolResultBudget | None:
+    """Parse Paperclip's strict managed byte budget without accepting partial policy."""
+    raw = os.getenv("HERMES_TOOL_RESULT_BUDGET_JSON", "").strip()
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+        keys = {"perResultBytes", "perTurnBytes", "perSessionBytes"}
+        if not isinstance(value, dict) or set(value) != keys:
+            return None
+        result = value["perResultBytes"]
+        turn = value["perTurnBytes"]
+        session = value["perSessionBytes"]
+        if any(isinstance(item, bool) or not isinstance(item, int) or item <= 0
+               for item in (result, turn, session)):
+            return None
+        if not result <= turn <= session:
+            return None
+        return ManagedToolResultBudget(result, turn, session)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 # Default config -- matches the historical hardcoded behavior exactly.

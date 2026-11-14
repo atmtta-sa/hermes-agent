@@ -50,9 +50,16 @@ from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
+    enforce_byte_budget,
+    truncate_to_byte_budget,
     extract_persisted_path,
 )
-from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
+from tools.budget_config import (
+    BudgetConfig,
+    DEFAULT_BUDGET,
+    budget_for_context_window,
+    managed_tool_result_budget_from_env,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +107,17 @@ def _budget_for_agent(agent) -> BudgetConfig:
     """
     try:
         ctx = getattr(getattr(agent, "context_compressor", None), "context_length", None)
-        return budget_for_context_window(int(ctx) if ctx else None)
+        base = budget_for_context_window(int(ctx) if ctx else None)
+        managed = managed_tool_result_budget_from_env()
+        if managed is None:
+            return base
+        return BudgetConfig(
+            default_result_size=min(base.default_result_size, managed.per_result_bytes),
+            turn_budget=min(base.turn_budget, managed.per_turn_bytes),
+            preview_size=base.preview_size,
+            mcp_result_size=min(base.mcp_result_size, managed.per_result_bytes),
+            tool_overrides=base.tool_overrides,
+        )
     except Exception:
         return DEFAULT_BUDGET
 
@@ -962,6 +979,33 @@ def _emit_tool_complete_and_risk(agent, ref: _ToolCallRef, result, risk_metadata
         )
 
 
+def _persist_tool_result_for_context(
+    function_result: str,
+    *,
+    function_name: str,
+    tool_call_id: str,
+    effective_task_id: str,
+    budget: BudgetConfig,
+) -> str:
+    """Apply managed byte policy, preserving read_file's non-spill recursion boundary."""
+    managed = managed_tool_result_budget_from_env()
+    managed_oversize = (
+        managed is not None
+        and len(function_result.encode("utf-8")) > managed.per_result_bytes
+    )
+    if managed_oversize and function_name == "read_file":
+        assert managed is not None
+        return truncate_to_byte_budget(function_result, managed.per_result_bytes)
+    return maybe_persist_tool_result(
+        content=function_result,
+        tool_name=function_name,
+        tool_use_id=tool_call_id,
+        env=get_active_env(effective_task_id),
+        config=budget,
+        threshold=0 if managed_oversize else None,
+    )
+
+
 def _commit_tool_result(
     agent,
     messages: list,
@@ -1012,12 +1056,12 @@ def _commit_tool_result(
 
     persisted_result = function_result
     if not _is_multimodal_tool_result(persisted_result):
-        persisted_result = maybe_persist_tool_result(
-            content=persisted_result,
-            tool_name=function_name,
-            tool_use_id=tool_call_id,
-            env=get_active_env(effective_task_id),
-            config=budget,
+        persisted_result = _persist_tool_result_for_context(
+            persisted_result,
+            function_name=function_name,
+            tool_call_id=tool_call_id,
+            effective_task_id=effective_task_id,
+            budget=budget,
         )
     _record_persisted_path_for_stub(agent, tool_call_id, persisted_result)
 
@@ -1052,7 +1096,17 @@ def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tool
     steer marker is never truncated/discarded when enforcement replaces a result."""
     if num_tools <= 0:
         return
-    enforce_turn_budget(messages[-num_tools:], env=get_active_env(effective_task_id), config=budget)
+    env = get_active_env(effective_task_id)
+    enforce_turn_budget(messages[-num_tools:], env=env, config=budget)
+    managed = managed_tool_result_budget_from_env()
+    if managed is not None:
+        enforce_byte_budget(messages[-num_tools:], managed.per_turn_bytes, env=env, config=budget)
+        enforce_byte_budget(
+            [message for message in messages if message.get("role") == "tool"],
+            managed.per_session_bytes,
+            env=env,
+            config=budget,
+        )
     agent._apply_pending_steer_to_tool_results(messages, num_tools)
 
 

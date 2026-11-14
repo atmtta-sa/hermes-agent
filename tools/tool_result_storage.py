@@ -259,6 +259,62 @@ def enforce_turn_budget(tool_messages: list[dict], env=None,
     return tool_messages
 
 
+def truncate_to_byte_budget(content: str, max_bytes: int) -> str:
+    """Return valid UTF-8 bounded text with an explicit pagination recovery notice."""
+    encoded = content.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return content
+    notice = "\n\n[Truncated by managed tool-result byte budget; re-read the original source with a narrower offset/limit.]"
+    notice_bytes = notice.encode("utf-8")
+    keep = max(0, max_bytes - len(notice_bytes))
+    prefix = encoded[:keep].decode("utf-8", errors="ignore")
+    return prefix + notice
+
+
+def enforce_byte_budget(tool_messages: list[dict], max_bytes: int, env=None,
+                        config: BudgetConfig = DEFAULT_BUDGET) -> list[dict]:
+    """Persist largest inline text results until their UTF-8 aggregate fits ``max_bytes``."""
+    def size(message: dict) -> int:
+        content = message.get("content", "")
+        return len(content.encode("utf-8")) if isinstance(content, str) else 0
+
+    sizes = [size(message) for message in tool_messages]
+    total_size = sum(sizes)
+    candidates = [
+        (index, item_size)
+        for index, item_size in enumerate(sizes)
+        if isinstance(tool_messages[index].get("content"), str)
+        and PERSISTED_OUTPUT_TAG not in tool_messages[index]["content"]
+    ]
+    for index, item_size in sorted(candidates, key=lambda item: item[1], reverse=True):
+        if total_size <= max_bytes:
+            break
+        content = tool_messages[index]["content"]
+        if tool_messages[index].get("tool_name") == "read_file":
+            replacement = truncate_to_byte_budget(
+                content,
+                min(max_bytes, config.preview_size),
+            )
+        else:
+            replacement = maybe_persist_tool_result(
+                content=content,
+                tool_name=_BUDGET_TOOL_NAME,
+                tool_use_id=tool_messages[index].get("tool_call_id", f"byte_budget_{index}"),
+                env=env,
+                config=config,
+                threshold=0,
+            )
+        if replacement != content:
+            total_size += len(replacement.encode("utf-8")) - item_size
+            tool_messages[index]["content"] = replacement
+            logger.info(
+                "Byte budget enforcement: persisted tool result %s (%d bytes)",
+                tool_messages[index].get("tool_call_id", index),
+                item_size,
+            )
+    return tool_messages
+
+
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
 # Names external plugins imported from this module before the Sep 2026 decomposition.
 # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
