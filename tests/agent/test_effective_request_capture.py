@@ -177,6 +177,41 @@ def test_chat_policy_denies_oversized_final_request_before_provider_call():
     assert "request" not in agent._effective_request_manifest
 
 
+def test_policy_denial_precedes_durable_transport_dispatch():
+    from agent.provider_transport_evidence import run_dispatched_transport
+
+    db = MagicMock()
+    agent = SimpleNamespace(
+        provider="openai-codex",
+        model="gpt-5.6-sol",
+        _effective_request_policy=_required_policy(maxRequestBytes=1),
+        _provider_transport_attempt_id="attempt-1",
+        _provider_transport_dispatched=False,
+        _provider_transport_uncertain=False,
+        _session_db=db,
+    )
+    request = {
+        "model": "gpt-5.6-sol",
+        "input": [{"role": "user", "content": "bounded task"}],
+    }
+
+    with pytest.raises(
+        effective_request_capture.EffectiveRequestPolicyDenied,
+        match="effective_request_request_bytes_exceeded",
+    ):
+        run_dispatched_transport(
+            agent,
+            lambda: effective_request_capture.capture_final_provider_request(
+                agent, request, transport="codex_responses",
+            ),
+        )
+
+    db.mark_provider_transport_dispatched.assert_not_called()
+    db.deny_provider_transport_pretransport.assert_called_once_with(
+        "attempt-1", "effective_request_request_bytes_exceeded",
+    )
+
+
 def test_codex_policy_denies_duplicate_large_block_before_provider_call():
     from agent.codex_runtime import run_codex_stream
     from run_agent import AIAgent
