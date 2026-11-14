@@ -306,6 +306,49 @@ def test_quiet_result_keeps_usage_and_provider_evidence_without_response_text(mo
     assert "private task body" not in target.read_text()
 
 
+def test_quiet_result_persists_content_free_context_telemetry(monkeypatch, tmp_path):
+    target = tmp_path / "run-result.json"
+    monkeypatch.setenv("HERMES_RUN_RESULT_FILE", str(target))
+    telemetry = {
+        "schema": "hermes.context_telemetry.v1",
+        "request_count": 1,
+        "verdict": "allowed",
+        "requests": [{
+            "schema": "hermes.effective_request_manifest.v1",
+            "transport": "chat_completions",
+            "provider": "openrouter",
+            "model": "moonshotai/kimi-k3",
+            "measurements": {
+                "request_bytes": 123,
+                "system_bytes": 20,
+                "messages_bytes": 40,
+                "tools_bytes": 2,
+                "message_count": 1,
+                "tool_count": 0,
+            },
+            "hashes": {
+                "request_sha256": "a" * 64,
+                "system_sha256": "b" * 64,
+                "messages_sha256": "c" * 64,
+                "tools_sha256": "d" * 64,
+            },
+            "duplicate_blocks": [],
+            "policy_sha256": "e" * 64,
+            "verdict": "allowed",
+            "reason": None,
+        }],
+    }
+
+    cli._write_quiet_result_file({
+        "context_telemetry": telemetry,
+        "final_response": "private task body must not persist",
+    }, "session-1")
+
+    report = json.loads(target.read_text())
+    assert report["context_telemetry"] == telemetry
+    assert "private task body" not in target.read_text()
+
+
 def test_unknown_cost_does_not_become_free(monkeypatch, tmp_path):
     import cli as cli_mod
 
