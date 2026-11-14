@@ -184,7 +184,7 @@ def prepare_transport(
 
 def dispatch_transport(agent: Any) -> None:
     attempt_id = getattr(agent, "_provider_transport_attempt_id", None)
-    if attempt_id:
+    if attempt_id and not getattr(agent, "_provider_transport_dispatched", False):
         agent._session_db.mark_provider_transport_dispatched(attempt_id)
         agent._provider_transport_dispatched = True
 
@@ -329,12 +329,11 @@ def record_transport_failure(
 
 
 def run_dispatched_transport(agent: Any, operation: Callable[[], T]) -> T:
-    """Mark dispatch immediately before the real transport and retain uncertainty on failure."""
-    dispatch_transport(agent)
+    """Run through the final-request boundary and seal failures by observed transport state."""
     try:
         return operation()
     except BaseException as exc:
-        mark_unknown(agent, exc)
+        record_transport_failure(agent, exc, "provider_pretransport_failure")
         raise
 
 

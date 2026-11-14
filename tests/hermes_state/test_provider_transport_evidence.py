@@ -172,6 +172,23 @@ def test_exact_run_records_dispatch_completion_and_pretransport_denial(tmp_path)
                       "cost_authority": "openai_codex_authenticated_subscription"}]
 
 
+def test_dispatch_transport_is_idempotent_for_internal_retries():
+    from agent.provider_transport_evidence import dispatch_transport
+
+    db = Mock()
+    agent = SimpleNamespace(
+        _provider_transport_attempt_id="attempt-1",
+        _provider_transport_dispatched=False,
+        _session_db=db,
+    )
+
+    dispatch_transport(agent)
+    dispatch_transport(agent)
+
+    db.mark_provider_transport_dispatched.assert_called_once_with("attempt-1")
+    assert agent._provider_transport_dispatched is True
+
+
 def test_prepare_if_needed_reuses_current_attempt():
     from agent.provider_transport_evidence import prepare_if_needed
 

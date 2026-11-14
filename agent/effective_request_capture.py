@@ -382,7 +382,9 @@ def capture_final_provider_request(
     }
     _enforce_effective_request_policy(agent, capture)
     sink = vars(agent).get("_effective_request_capture_sink")
-    if not callable(sink):
-        return
-    sink(capture)
-    raise EffectiveRequestCaptured("Final provider request captured; transport skipped")
+    if callable(sink):
+        sink(capture)
+        raise EffectiveRequestCaptured("Final provider request captured; transport skipped")
+    from agent.provider_transport_evidence import dispatch_transport
+
+    dispatch_transport(agent)
