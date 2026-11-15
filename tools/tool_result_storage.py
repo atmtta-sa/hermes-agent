@@ -24,6 +24,7 @@ SPILLOVER_MAX_AGE_HOURS = 24
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
+_DUPLICATE_RESULT_MIN_BYTES = 512
 
 _spillover_prune_lock = threading.Lock()
 _spillover_pruned_homes: set = set()  # profile home keys already swept this process
@@ -231,6 +232,33 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
                 tool_name, len(content))
     return (f"{preview}\n\n[Truncated: tool response was {len(content):,} chars. "
             "Full output could not be saved to sandbox.]")
+
+
+def deduplicate_tool_result(
+    tool_messages: list[dict], content, *, minimum_bytes: int = _DUPLICATE_RESULT_MIN_BYTES
+):
+    """Replace a repeated large tool result with a content-free reference to its first copy."""
+    if not isinstance(content, str):
+        return content
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    encoded = normalized.encode("utf-8")
+    if len(encoded) < minimum_bytes:
+        return content
+    for message in tool_messages:
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        previous = message.get("content")
+        if not isinstance(previous, str):
+            continue
+        previous = previous.replace("\r\n", "\n").replace("\r", "\n")
+        if previous == normalized:
+            digest = hashlib.sha256(encoded).hexdigest()
+            reference = message.get("tool_call_id") or "earlier tool result"
+            return (
+                "[Repeated tool result omitted; identical to "
+                f"{reference}; sha256={digest}; bytes={len(encoded)}.]"
+            )
+    return content
 
 
 def enforce_turn_budget(tool_messages: list[dict], env=None,

@@ -49,6 +49,7 @@ from tools.terminal_tool_lifecycle import get_active_env
 from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
     maybe_persist_tool_result,
+    deduplicate_tool_result,
     enforce_turn_budget,
     enforce_byte_budget,
     truncate_to_byte_budget,
@@ -1006,6 +1007,13 @@ def _persist_tool_result_for_context(
     )
 
 
+def _duplicate_result_min_bytes(agent) -> int:
+    policy = vars(agent).get("_effective_request_policy")
+    if isinstance(policy, dict):
+        return policy.get("minDuplicateBlockBytes", 512)
+    return 512
+
+
 def _commit_tool_result(
     agent,
     messages: list,
@@ -1072,6 +1080,12 @@ def _commit_tool_result(
             _append_subdir_hint_to_multimodal(persisted_result, subdir_hints)
         else:
             persisted_result += subdir_hints
+
+    persisted_result = deduplicate_tool_result(
+        messages,
+        persisted_result,
+        minimum_bytes=_duplicate_result_min_bytes(agent),
+    )
 
     # Multimodal dicts become an OpenAI-style content list; text-only servers get a
     # string-safe fallback so a rejected image result never poisons history.
