@@ -267,8 +267,10 @@ def _prepare_transport_or_budget_stop(
     current_turn_user_idx: Any,
     api_call_count: Any,
 ) -> IterationPrep | None:
+    from agent.tool_executor import _enforce_managed_session_budget
     from agent.provider_transport_evidence import deny_pretransport, prepare_transport
 
+    _enforce_managed_session_budget(agent, messages)
     budget_stop = _request_budget_stop_verdict(
         agent, messages, request_logger, current_turn_user_idx,
     )

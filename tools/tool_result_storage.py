@@ -26,6 +26,7 @@ _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
 _DUPLICATE_RESULT_MIN_BYTES = 512
 
+
 _spillover_prune_lock = threading.Lock()
 _spillover_pruned_homes: set = set()  # profile home keys already swept this process
 
@@ -193,6 +194,26 @@ def extract_persisted_path(content: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def _managed_budget_reference(content: str, tool_call_id: str,
+                              persisted_path: str | None = None) -> str:
+    """Return a content-free recovery reference for an older tool result."""
+    encoded = content.encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    if persisted_path:
+        return (
+            f"{PERSISTED_OUTPUT_TAG}\n"
+            "Preview omitted by managed tool-result byte budget.\n"
+            f"Full output saved to: {persisted_path}\n"
+            f"sha256={digest}; bytes={len(encoded)}; tool_call_id={tool_call_id}.\n"
+            "Use read_file with offset and limit to access the saved output.\n"
+            f"{PERSISTED_OUTPUT_CLOSING_TAG}"
+        )
+    return (
+        "[Tool result omitted by managed tool-result byte budget; "
+        f"tool_call_id={tool_call_id}; sha256={digest}; bytes={len(encoded)}.]"
+    )
+
+
 def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, env=None,
                               config: BudgetConfig = DEFAULT_BUDGET,
                               threshold: int | float | None = None) -> str:
@@ -299,6 +320,62 @@ def truncate_to_byte_budget(content: str, max_bytes: int) -> str:
     return prefix + notice
 
 
+def _byte_budget_replacement(message: dict, index: int, max_bytes: int, env,
+                             config: BudgetConfig) -> str:
+    content = message["content"]
+    tool_call_id = message.get("tool_call_id", f"byte_budget_{index}")
+    persisted_path = message.get("_managed_persisted_path")
+    if isinstance(persisted_path, str) and persisted_path:
+        return _managed_budget_reference(content, tool_call_id, persisted_path)
+    if message.get("tool_name") == "read_file":
+        return truncate_to_byte_budget(content, min(max_bytes, config.preview_size))
+    replacement = maybe_persist_tool_result(
+        content=content,
+        tool_name=_BUDGET_TOOL_NAME,
+        tool_use_id=tool_call_id,
+        env=env,
+        config=config,
+        threshold=0,
+    )
+    generated_path = extract_persisted_path(replacement)
+    if generated_path:
+        message["_managed_persisted_path"] = generated_path
+    return replacement
+
+
+def _apply_byte_budget_candidate(message: dict, index: int, item_size: int,
+                                 total_size: int, max_bytes: int, env,
+                                 config: BudgetConfig) -> int:
+    content = message["content"]
+    tool_call_id = message.get("tool_call_id", f"byte_budget_{index}")
+    replacement = _byte_budget_replacement(message, index, max_bytes, env, config)
+    projected_size = total_size + len(replacement.encode("utf-8")) - item_size
+    if projected_size > max_bytes:
+        persisted_path = message.get("_managed_persisted_path")
+        replacement = _managed_budget_reference(
+            replacement,
+            tool_call_id,
+            persisted_path if isinstance(persisted_path, str) else None,
+        )
+    if replacement == content:
+        return total_size
+    message["content"] = replacement
+    logger.info("Byte budget enforcement: persisted tool result %s (%d bytes)",
+                message.get("tool_call_id", index), item_size)
+    return total_size + len(replacement.encode("utf-8")) - item_size
+
+
+def _clear_oldest_results_to_fit(tool_messages: list[dict], total_size: int,
+                                 max_bytes: int) -> None:
+    for message in tool_messages:
+        if total_size <= max_bytes:
+            return
+        content = message.get("content", "")
+        if isinstance(content, str) and content:
+            total_size -= len(content.encode("utf-8"))
+            message["content"] = ""
+
+
 def enforce_byte_budget(tool_messages: list[dict], max_bytes: int, env=None,
                         config: BudgetConfig = DEFAULT_BUDGET) -> list[dict]:
     """Persist largest inline text results until their UTF-8 aggregate fits ``max_bytes``."""
@@ -312,34 +389,15 @@ def enforce_byte_budget(tool_messages: list[dict], max_bytes: int, env=None,
         (index, item_size)
         for index, item_size in enumerate(sizes)
         if isinstance(tool_messages[index].get("content"), str)
-        and PERSISTED_OUTPUT_TAG not in tool_messages[index]["content"]
+        and tool_messages[index]["content"]
     ]
     for index, item_size in sorted(candidates, key=lambda item: item[1], reverse=True):
         if total_size <= max_bytes:
             break
-        content = tool_messages[index]["content"]
-        if tool_messages[index].get("tool_name") == "read_file":
-            replacement = truncate_to_byte_budget(
-                content,
-                min(max_bytes, config.preview_size),
-            )
-        else:
-            replacement = maybe_persist_tool_result(
-                content=content,
-                tool_name=_BUDGET_TOOL_NAME,
-                tool_use_id=tool_messages[index].get("tool_call_id", f"byte_budget_{index}"),
-                env=env,
-                config=config,
-                threshold=0,
-            )
-        if replacement != content:
-            total_size += len(replacement.encode("utf-8")) - item_size
-            tool_messages[index]["content"] = replacement
-            logger.info(
-                "Byte budget enforcement: persisted tool result %s (%d bytes)",
-                tool_messages[index].get("tool_call_id", index),
-                item_size,
-            )
+        total_size = _apply_byte_budget_candidate(
+            tool_messages[index], index, item_size, total_size, max_bytes, env, config
+        )
+    _clear_oldest_results_to_fit(tool_messages, total_size, max_bytes)
     return tool_messages
 
 
