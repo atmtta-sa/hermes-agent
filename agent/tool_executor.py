@@ -122,6 +122,19 @@ def _budget_for_agent(agent) -> BudgetConfig:
     except Exception:
         return DEFAULT_BUDGET
 
+
+def _enforce_managed_session_budget(agent, messages: list[dict], env=None) -> None:
+    """Bound all tool history, including rows reloaded from an append-only session store."""
+    managed = managed_tool_result_budget_from_env()
+    if managed is None:
+        return
+    enforce_byte_budget(
+        [message for message in messages if message.get("role") == "tool"],
+        managed.per_session_bytes,
+        env=env,
+        config=_budget_for_agent(agent),
+    )
+
 _MAX_TOOL_WORKERS = 8  # concurrent worker threads per batch
 _DEFAULT_IMAGE_PARALLEL_REQUESTS = 4
 # Generous: slow-but-valid tool work must never be preempted by the batch guard.
@@ -1014,6 +1027,18 @@ def _duplicate_result_min_bytes(agent) -> int:
     return 512
 
 
+def _generated_persisted_path(original_result, persisted_result):
+    if persisted_result == original_result:
+        return None
+    return extract_persisted_path(persisted_result)
+
+
+def _mark_managed_persisted_path(tool_message: dict, persisted_result,
+                                 managed_persisted_path) -> None:
+    if managed_persisted_path and extract_persisted_path(persisted_result) == managed_persisted_path:
+        tool_message["_managed_persisted_path"] = managed_persisted_path
+
+
 def _commit_tool_result(
     agent,
     messages: list,
@@ -1063,7 +1088,9 @@ def _commit_tool_result(
     agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")
 
     persisted_result = function_result
+    managed_persisted_path = None
     if not _is_multimodal_tool_result(persisted_result):
+        original_result = persisted_result
         persisted_result = _persist_tool_result_for_context(
             persisted_result,
             function_name=function_name,
@@ -1071,6 +1098,7 @@ def _commit_tool_result(
             effective_task_id=effective_task_id,
             budget=budget,
         )
+        managed_persisted_path = _generated_persisted_path(original_result, persisted_result)
     _record_persisted_path_for_stub(agent, tool_call_id, persisted_result)
 
     subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
@@ -1091,6 +1119,7 @@ def _commit_tool_result(
     # string-safe fallback so a rejected image result never poisons history.
     _tool_content = agent._tool_result_content_for_active_model(function_name, persisted_result)
     tool_message = make_tool_result_message(function_name, _tool_content, tool_call_id, effect_disposition=effect_disposition)
+    _mark_managed_persisted_path(tool_message, persisted_result, managed_persisted_path)
     messages.append(tool_message)
     if not _flush_session_db_after_tool_progress(agent, messages, stage=f"tool result {function_name}"):
         return None
