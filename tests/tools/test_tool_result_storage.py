@@ -17,6 +17,7 @@ from tools.tool_result_storage import (
     _safe_result_filename,
     _write_to_sandbox,
     cleanup_spillover_cache,
+    deduplicate_tool_result,
     enforce_turn_budget,
     generate_preview,
     get_spillover_dir,
@@ -246,6 +247,36 @@ class TestMaybePersistToolResult:
         )
         # Any non-empty content with threshold=0 should be persisted
         assert PERSISTED_OUTPUT_TAG in result
+
+
+# ── deduplicate_tool_result ──────────────────────────────────────────
+
+class TestDeduplicateToolResult:
+    def test_compacts_large_exact_repeat(self):
+        content = "bounded search result " * 40
+        messages = [{
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": content,
+        }]
+
+        result = deduplicate_tool_result(messages, content)
+
+        assert content not in result
+        assert "call-1" in result
+        assert "sha256=" in result
+        assert len(result.encode("utf-8")) < 512
+
+    def test_keeps_first_or_small_result_unchanged(self):
+        content = "small repeated result"
+        messages = [{
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": content,
+        }]
+
+        assert deduplicate_tool_result([], content) == content
+        assert deduplicate_tool_result(messages, content) == content
 
 
 # ── enforce_turn_budget ───────────────────────────────────────────────
